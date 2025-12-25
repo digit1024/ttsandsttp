@@ -1,0 +1,69 @@
+#!/bin/sh
+set -e
+
+# Post-installation script for ttsandsttp
+
+if [ "$1" = "configure" ]; then
+    # Note: User config will be created automatically on first run
+    # The default config template is available at /etc/ttsandsttp/config.toml.default
+    
+    # Update library cache
+    if command -v ldconfig >/dev/null 2>&1; then
+        ldconfig
+    fi
+    
+    # Try to enable and start service for all logged-in users
+    # Note: This runs as root, so we use systemd-run to execute as each user
+    SERVICE_ENABLED=0
+    for user_dir in /run/user/*; do
+        if [ -d "$user_dir" ]; then
+            user_id=$(basename "$user_dir")
+            username=$(getent passwd "$user_id" 2>/dev/null | cut -d: -f1 || echo "user-$user_id")
+            
+            # Reload systemd user daemon
+            systemd-run --uid="$user_id" --systemd-user --quiet systemctl --user daemon-reload 2>/dev/null || true
+            
+            # Enable service (non-blocking, don't fail if it doesn't work)
+            if systemd-run --uid="$user_id" --systemd-user --quiet systemctl --user --no-block enable ttsandsttp.service 2>/dev/null; then
+                echo "✅ Enabled ttsandsttp.service for user: $username"
+                SERVICE_ENABLED=1
+                
+                # Start service (non-blocking)
+                systemd-run --uid="$user_id" --systemd-user --quiet systemctl --user --no-block start ttsandsttp.service 2>/dev/null && \
+                    echo "✅ Started ttsandsttp.service for user: $username" || \
+                    echo "⚠️  Service enabled but not started for user: $username (will start on next login)"
+            fi
+        fi
+    done
+    
+    # Provide feedback
+    if [ "$SERVICE_ENABLED" -eq 0 ]; then
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "TTSandSTTP has been installed successfully!"
+        echo ""
+        echo "To enable and start the service, run (as your user):"
+        echo "  systemctl --user daemon-reload"
+        echo "  systemctl --user enable --now ttsandsttp.service"
+        echo ""
+        echo "Configuration will be created automatically at ~/.config/ttsandsttp/config.toml"
+        echo "on first run. A template is available at /etc/ttsandsttp/config.toml.default"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+    else
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "TTSandSTTP has been installed and service enabled!"
+        echo ""
+        echo "Configuration will be created automatically at ~/.config/ttsandsttp/config.toml"
+        echo "on first run. A template is available at /etc/ttsandsttp/config.toml.default"
+        echo ""
+        echo "Check service status with:"
+        echo "  systemctl --user status ttsandsttp.service"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+    fi
+fi
+
+#DEBHELPER#
+

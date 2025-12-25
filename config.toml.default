@@ -1,0 +1,101 @@
+# TTSandSTTP Configuration File
+# This file will be copied to ~/.config/ttsandsttp/config.toml on first run
+# Uncomment languages you want to enable
+
+[tts]
+# Default TTS language (used when language is not specified)
+default = "en"
+
+# English (US) - Default enabled
+[tts.en]
+enabled = true
+# Available models:
+#   - "vits-piper-en_US-amy-low" (voice: amy, quality: low, 64MB) - DEFAULT
+#   - "vits-piper-en_US-libritts_r-medium" (voice: libritts_r, quality: medium, 128MB)
+#   - "vits-piper-en_US-glados" (voice: glados, quality: medium, 128MB)
+#   - "vits-piper-en_US-lessac-medium" (voice: lessac, quality: medium, 128MB)
+#   - "vits-piper-en_US-libritts-high" (voice: libritts, quality: high, 256MB)
+model_id = "vits-piper-en_US-amy-low"
+
+# Spanish (Spain) - Disabled by default
+# [tts.es]
+# enabled = false
+# Available models:
+#   - "vits-piper-es_ES-shared-medium" (voice: shared, quality: medium, 128MB)
+#   - "vits-piper-es_ES-dfx-medium" (voice: dfx, quality: medium, 128MB)
+# model_id = "vits-piper-es_ES-shared-medium"
+
+# French (France) - Disabled by default
+# [tts.fr]
+# enabled = false
+# Available models:
+#   - "vits-piper-fr_FR-upmc-medium" (voice: upmc, quality: medium, 128MB)
+#   - "vits-piper-fr_FR-siwis-medium" (voice: siwis, quality: medium, 128MB)
+# model_id = "vits-piper-fr_FR-upmc-medium"
+
+# German - Disabled by default
+# [tts.de]
+# enabled = false
+# Available models:
+#   - "vits-piper-de_DE-thorsten-medium" (voice: thorsten, quality: medium, 128MB)
+# model_id = "vits-piper-de_DE-thorsten-medium"
+
+# Italian - Disabled by default
+# [tts.it]
+# enabled = false
+# Available models:
+#   - "vits-piper-it_IT-riccardo-medium" (voice: riccardo, quality: medium, 128MB)
+# model_id = "vits-piper-it_IT-riccardo-medium"
+
+# Portuguese (Brazil) - Disabled by default
+# [tts.pt]
+# enabled = false
+# Available models:
+#   - "vits-piper-pt_BR-faber-medium" (voice: faber, quality: medium, 128MB)
+# model_id = "vits-piper-pt_BR-faber-medium"
+
+# Chinese (Mandarin) - Disabled by default
+# [tts.zh]
+# enabled = false
+# Available models:
+#   - "vits-piper-zh_CN-huayan-medium" (voice: huayan, quality: medium, 128MB)
+# model_id = "vits-piper-zh_CN-huayan-medium"
+
+# Japanese - Disabled by default
+# [tts.ja]
+# enabled = false
+# Available models:
+#   - "vits-piper-ja_JP-shinji-medium" (voice: shinji, quality: medium, 128MB)
+# model_id = "vits-piper-ja_JP-shinji-medium"
+
+# Russian - Disabled by default
+# [tts.ru]
+# enabled = false
+# Available models:
+#   - "vits-piper-ru_RU-irina-medium" (voice: irina, quality: medium, 128MB)
+# model_id = "vits-piper-ru_RU-irina-medium"
+
+# Polish - Disabled by default
+# [tts.pl]
+# enabled = false
+# Available models:
+#   - "vits-piper-pl_PL-zenski_wg_glos-medium" (voice: zenski, quality: medium, 60MB) - DEFAULT
+#   - "vits-piper-pl_PL-gosia-medium" (voice: gosia, quality: medium, 60MB)
+#   - "vits-piper-pl_PL-meski_wg_glos-medium" (voice: meski, quality: medium, 60MB)
+#   - "vits-piper-pl_PL-darkman-medium" (voice: darkman, quality: medium, 60MB)
+#   - "vits-piper-pl_PL-jarvis_wg_glos-medium" (voice: jarvis, quality: medium, 60MB)
+#   - "vits-piper-pl_PL-justyna_wg_glos-medium" (voice: justyna, quality: medium, 60MB)
+#   - "vits-piper-pl_PL-mc_speech-medium" (voice: mc_speech, quality: medium, 60MB)
+# model_id = "vits-piper-pl_PL-zenski_wg_glos-medium"
+
+[stt]
+# Whisper model to use for Speech-to-Text
+# Options: 
+#   - "sherpa-onnx-whisper-tiny" (recommended, multilingual, 75MB)
+#   - "sherpa-onnx-whisper-tiny.en" (English only, 75MB)
+#   - "sherpa-onnx-whisper-base" (multilingual, 150MB)
+#   - "sherpa-onnx-whisper-base.en" (English only, 150MB)
+#   - "sherpa-onnx-whisper-small" (multilingual, 500MB)
+#   - "sherpa-onnx-whisper-medium" (multilingual, 1.5GB)
+#   - "sherpa-onnx-whisper-large-v3" (multilingual, 3GB)
+model_id = "sherpa-onnx-whisper-tiny"

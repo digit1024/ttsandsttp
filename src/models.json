@@ -1,0 +1,251 @@
+{
+  "tts": {
+    "en": [
+      {
+        "id": "vits-piper-en_US-amy-low",
+        "voice": "amy",
+        "quality": "low",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-amy-low.tar.bz2",
+        "required_files": ["en_US-amy-low.onnx", "tokens.txt"],
+        "size_mb": 64
+      },
+      {
+        "id": "vits-piper-en_US-libritts_r-medium",
+        "voice": "libritts_r",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-libritts_r-medium.tar.bz2",
+        "required_files": ["en_US-libritts_r-medium.onnx", "tokens.txt"],
+        "size_mb": 128
+      },
+      {
+        "id": "vits-piper-en_US-glados",
+        "voice": "glados",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-glados.tar.bz2",
+        "required_files": ["en_US-glados.onnx", "tokens.txt"],
+        "size_mb": 128
+      },
+      {
+        "id": "vits-piper-en_US-lessac-medium",
+        "voice": "lessac",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-lessac-medium.tar.bz2",
+        "required_files": ["en_US-lessac-medium.onnx", "tokens.txt"],
+        "size_mb": 128
+      },
+      {
+        "id": "vits-piper-en_US-libritts-high",
+        "voice": "libritts",
+        "quality": "high",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-libritts-high.tar.bz2",
+        "required_files": ["en_US-libritts-high.onnx", "tokens.txt"],
+        "size_mb": 256
+      }
+    ],
+    "es": [
+      {
+        "id": "vits-piper-es_ES-shared-medium",
+        "voice": "shared",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-es_ES-shared-medium.tar.bz2",
+        "required_files": ["es_ES-shared-medium.onnx", "tokens.txt"],
+        "size_mb": 128
+      },
+      {
+        "id": "vits-piper-es_ES-dfx-medium",
+        "voice": "dfx",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-es_ES-dfx-medium.tar.bz2",
+        "required_files": ["es_ES-dfx-medium.onnx", "tokens.txt"],
+        "size_mb": 128
+      }
+    ],
+    "fr": [
+      {
+        "id": "vits-piper-fr_FR-upmc-medium",
+        "voice": "upmc",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-fr_FR-upmc-medium.tar.bz2",
+        "required_files": ["fr_FR-upmc-medium.onnx", "tokens.txt"],
+        "size_mb": 128
+      },
+      {
+        "id": "vits-piper-fr_FR-siwis-medium",
+        "voice": "siwis",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-fr_FR-siwis-medium.tar.bz2",
+        "required_files": ["fr_FR-siwis-medium.onnx", "tokens.txt"],
+        "size_mb": 128
+      }
+    ],
+    "de": [
+      {
+        "id": "vits-piper-de_DE-thorsten-medium",
+        "voice": "thorsten",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-de_DE-thorsten-medium.tar.bz2",
+        "required_files": ["de_DE-thorsten-medium.onnx", "tokens.txt"],
+        "size_mb": 128
+      }
+    ],
+    "it": [
+      {
+        "id": "vits-piper-it_IT-riccardo-medium",
+        "voice": "riccardo",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-it_IT-riccardo-medium.tar.bz2",
+        "required_files": ["it_IT-riccardo-medium.onnx", "tokens.txt"],
+        "size_mb": 128
+      }
+    ],
+    "pt": [
+      {
+        "id": "vits-piper-pt_BR-faber-medium",
+        "voice": "faber",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-pt_BR-faber-medium.tar.bz2",
+        "required_files": ["pt_BR-faber-medium.onnx", "tokens.txt"],
+        "size_mb": 128
+      }
+    ],
+    "zh": [
+      {
+        "id": "vits-piper-zh_CN-huayan-medium",
+        "voice": "huayan",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-zh_CN-huayan-medium.tar.bz2",
+        "required_files": ["zh_CN-huayan-medium.onnx", "tokens.txt"],
+        "size_mb": 128
+      }
+    ],
+    "ja": [
+      {
+        "id": "vits-piper-ja_JP-shinji-medium",
+        "voice": "shinji",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-ja_JP-shinji-medium.tar.bz2",
+        "required_files": ["ja_JP-shinji-medium.onnx", "tokens.txt"],
+        "size_mb": 128
+      }
+    ],
+    "ru": [
+      {
+        "id": "vits-piper-ru_RU-irina-medium",
+        "voice": "irina",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-ru_RU-irina-medium.tar.bz2",
+        "required_files": ["ru_RU-irina-medium.onnx", "tokens.txt"],
+        "size_mb": 128
+      }
+    ],
+    "pl": [
+      {
+        "id": "vits-piper-pl_PL-zenski_wg_glos-medium",
+        "voice": "zenski",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-pl_PL-zenski_wg_glos-medium.tar.bz2",
+        "required_files": ["pl_PL-zenski_wg_glos-medium.onnx", "tokens.txt"],
+        "size_mb": 60
+      },
+      {
+        "id": "vits-piper-pl_PL-gosia-medium",
+        "voice": "gosia",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-pl_PL-gosia-medium.tar.bz2",
+        "required_files": ["pl_PL-gosia-medium.onnx", "tokens.txt"],
+        "size_mb": 60
+      },
+      {
+        "id": "vits-piper-pl_PL-meski_wg_glos-medium",
+        "voice": "meski",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-pl_PL-meski_wg_glos-medium.tar.bz2",
+        "required_files": ["pl_PL-meski_wg_glos-medium.onnx", "tokens.txt"],
+        "size_mb": 60
+      },
+      {
+        "id": "vits-piper-pl_PL-darkman-medium",
+        "voice": "darkman",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-pl_PL-darkman-medium.tar.bz2",
+        "required_files": ["pl_PL-darkman-medium.onnx", "tokens.txt"],
+        "size_mb": 60
+      },
+      {
+        "id": "vits-piper-pl_PL-jarvis_wg_glos-medium",
+        "voice": "jarvis",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-pl_PL-jarvis_wg_glos-medium.tar.bz2",
+        "required_files": ["pl_PL-jarvis_wg_glos-medium.onnx", "tokens.txt"],
+        "size_mb": 60
+      },
+      {
+        "id": "vits-piper-pl_PL-justyna_wg_glos-medium",
+        "voice": "justyna",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-pl_PL-justyna_wg_glos-medium.tar.bz2",
+        "required_files": ["pl_PL-justyna_wg_glos-medium.onnx", "tokens.txt"],
+        "size_mb": 60
+      },
+      {
+        "id": "vits-piper-pl_PL-mc_speech-medium",
+        "voice": "mc_speech",
+        "quality": "medium",
+        "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-pl_PL-mc_speech-medium.tar.bz2",
+        "required_files": ["pl_PL-mc_speech-medium.onnx", "tokens.txt"],
+        "size_mb": 60
+      }
+    ]
+  },
+  "stt_whisper": {
+    "sherpa-onnx-whisper-tiny": {
+      "id": "sherpa-onnx-whisper-tiny",
+      "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.tar.bz2",
+      "required_files": ["tiny-encoder.int8.onnx", "tiny-decoder.int8.onnx", "tiny-tokens.txt"],
+      "size": "tiny",
+      "language_code": "multilingual"
+    },
+    "sherpa-onnx-whisper-tiny.en": {
+      "id": "sherpa-onnx-whisper-tiny.en",
+      "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.en.tar.bz2",
+      "required_files": ["tiny.en-encoder.int8.onnx", "tiny.en-decoder.int8.onnx", "tiny.en-tokens.txt"],
+      "size": "tiny",
+      "language_code": "en"
+    },
+    "sherpa-onnx-whisper-base": {
+      "id": "sherpa-onnx-whisper-base",
+      "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-base.tar.bz2",
+      "required_files": ["base-encoder.int8.onnx", "base-decoder.int8.onnx", "base-tokens.txt"],
+      "size": "base",
+      "language_code": "multilingual"
+    },
+    "sherpa-onnx-whisper-base.en": {
+      "id": "sherpa-onnx-whisper-base.en",
+      "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-base.en.tar.bz2",
+      "required_files": ["base.en-encoder.int8.onnx", "base.en-decoder.int8.onnx", "base.en-tokens.txt"],
+      "size": "base",
+      "language_code": "en"
+    },
+    "sherpa-onnx-whisper-small": {
+      "id": "sherpa-onnx-whisper-small",
+      "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-small.tar.bz2",
+      "required_files": ["small-encoder.int8.onnx", "small-decoder.int8.onnx", "small-tokens.txt"],
+      "size": "small",
+      "language_code": "multilingual"
+    },
+    "sherpa-onnx-whisper-medium": {
+      "id": "sherpa-onnx-whisper-medium",
+      "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-medium.tar.bz2",
+      "required_files": ["medium-encoder.int8.onnx", "medium-decoder.int8.onnx", "medium-tokens.txt"],
+      "size": "medium",
+      "language_code": "multilingual"
+    },
+    "sherpa-onnx-whisper-large-v3": {
+      "id": "sherpa-onnx-whisper-large-v3",
+      "download_url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-large-v3.tar.bz2",
+      "required_files": ["large-v3-encoder.int8.onnx", "large-v3-decoder.int8.onnx", "large-v3-tokens.txt"],
+      "size": "large",
+      "language_code": "multilingual"
+    }
+  }
+}

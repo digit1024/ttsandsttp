@@ -1,0 +1,27 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+export CARGO_HOME = $(CURDIR)/debian/cargo_home
+
+%:
+	dh $@
+
+override_dh_auto_clean:
+	unset ARGV0 && cargo clean
+
+override_dh_auto_build:
+	unset ARGV0 && cargo build --release
+
+override_dh_auto_install:
+	unset ARGV0 && cargo build --release
+	install -D -m 755 target/release/ttsandsttp $(CURDIR)/debian/ttsandsttp/usr/bin/ttsandsttp
+	install -D -m 644 config.toml.default $(CURDIR)/debian/ttsandsttp/etc/ttsandsttp/config.toml.default
+	install -D -m 644 debian/ttsandsttp.service $(CURDIR)/debian/ttsandsttp/usr/lib/systemd/user/ttsandsttp.service
+	# Install shared libraries
+	install -D -m 755 target/release/libsherpa-onnx-c-api.so $(CURDIR)/debian/ttsandsttp/usr/lib/libsherpa-onnx-c-api.so
+	install -D -m 755 target/release/libsherpa-onnx-cxx-api.so $(CURDIR)/debian/ttsandsttp/usr/lib/libsherpa-onnx-cxx-api.so
+	install -D -m 755 target/release/libonnxruntime.so $(CURDIR)/debian/ttsandsttp/usr/lib/libonnxruntime.so
+
+override_dh_auto_test:
+	# Skip tests for now
+

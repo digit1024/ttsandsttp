@@ -1,0 +1,21 @@
+Source: ttsandsttp
+Section: utils
+Priority: optional
+Maintainer: digit1024 <digit1024@example.com>
+Build-Depends: debhelper-compat (= 13), cargo, rustc, libasound2-dev, pkg-config
+Standards-Version: 4.6.2
+Homepage: https://github.com/digit1024/ttsandsttp
+
+Package: ttsandsttp
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libasound2, wtype | libxdo-dev, dbus
+Description: Text-to-Speech and Speech-to-Text service with DBus interface
+ A Rust CLI application implementing Text-to-Speech (TTS) and Speech-to-Text
+ (STT) functionality using sherpa-rs, with DBus daemon mode support.
+ .
+ Features:
+  - Automatic model download and management
+  - DBus interface for remote method calls
+  - Support for multiple languages
+  - Keyboard typing integration for STT results
+

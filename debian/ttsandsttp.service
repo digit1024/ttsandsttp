@@ -1,0 +1,16 @@
+[Unit]
+Description=TTSandSTTP DBus Service
+Documentation=https://github.com/digit1024/ttsandsttp
+After=dbus.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ttsandsttp daemon
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+
