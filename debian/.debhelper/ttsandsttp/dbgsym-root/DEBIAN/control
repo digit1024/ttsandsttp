@@ -1,0 +1,13 @@
+Package: ttsandsttp-dbgsym
+Package-Type: ddeb
+Source: ttsandsttp
+Version: 0.1.0-1
+Auto-Built-Package: debug-symbols
+Architecture: amd64
+Maintainer: digit1024 <digit1024@example.com>
+Installed-Size: 3596
+Depends: ttsandsttp (= 0.1.0-1)
+Section: debug
+Priority: optional
+Description: debug symbols for ttsandsttp
+Build-Ids: 0e6772deaf9b76f98e8eaac7c12a6ac8d2424cc3 27770705433791ccc3bfa8e20b63aa3239ebdde4 e826462e97e914252d958209a7c491847c9ea336

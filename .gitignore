@@ -1,0 +1,54 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE/Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+Thumbs.db
+.DS_Store
+.directory
+
+# Debug/Test artifacts
+*.log
+*.tmp
+*.cache
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Generated files
+*.orig
+*.rej
+
+# Debian packaging
+debian/cargo_home/
+debian/ttsandsttp/
+debian/files
+debian/*.substvars
+debian/*.log
+*.deb
+*.dsc
+*.changes
+*.buildinfo
+*.tar.gz
+*.tar.xz
+*.tar.bz2

@@ -1,0 +1,27 @@
+#!/bin/sh
+set -e
+
+# Post-removal script for ttsandsttp
+
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    # Stop and disable service if running
+    if systemctl --user is-active ttsandsttp.service >/dev/null 2>&1; then
+        systemctl --user stop ttsandsttp.service || true
+    fi
+    if systemctl --user is-enabled ttsandsttp.service >/dev/null 2>&1; then
+        systemctl --user disable ttsandsttp.service || true
+    fi
+    systemctl --user daemon-reload 2>/dev/null || true
+fi
+
+if [ "$1" = "purge" ]; then
+    # Remove user config directory if it exists
+    USER_CONFIG_DIR="$HOME/.config/ttsandsttp"
+    if [ -d "$USER_CONFIG_DIR" ]; then
+        echo "Note: User configuration at $USER_CONFIG_DIR was not removed."
+        echo "Remove it manually if desired."
+    fi
+fi
+
+#DEBHELPER#
+
