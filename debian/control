@@ -19,3 +19,4 @@ Description: Text-to-Speech and Speech-to-Text service with DBus interface
   - Support for multiple languages
   - Keyboard typing integration for STT results
 
+
