@@ -108,6 +108,8 @@ impl SttService {
     }
     
     /// Invoke result callback if set
+    // this dead code is allowed because it is used in the daemon service
+    #[allow(dead_code)]
     fn invoke_result_callback(&self, text: &str) {
         let cb = self.result_callback.lock().unwrap();
         if let Some(ref callback) = *cb {
@@ -116,13 +118,14 @@ impl SttService {
     }
     
     /// Invoke pause callback if set
+    #[allow(dead_code)]
     fn invoke_pause_callback(&self) {
         let cb = self.pause_callback.lock().unwrap();
         if let Some(ref callback) = *cb {
             callback();
         }
     }
-    
+    #[allow(dead_code)]
     /// Invoke error callback if set
     fn invoke_error_callback(&self, error: String) {
         let cb = self.error_callback.lock().unwrap();
@@ -500,7 +503,7 @@ impl SttService {
             .default_input_config()
             .map_err(|e| anyhow::anyhow!("Failed to get input config: {}", e))?;
 
-        let input_sample_rate = config.sample_rate().0 as u32;
+        let input_sample_rate = config.sample_rate() as u32;
         let channels = config.channels() as usize;
         
         // Initialize audio processor and pause detector

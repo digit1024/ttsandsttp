@@ -273,15 +273,15 @@ impl TtsService {
 
     /// Play audio samples using rodio
     async fn play_audio(&self, audio: &sherpa_rs::tts::TtsAudio) -> Result<()> {
-        use rodio::{Decoder, OutputStream, Sink};
+        use rodio::{Decoder, OutputStreamBuilder, Sink};
         use std::io::Cursor;
 
         // Create output stream and sink
-        let (stream, stream_handle) = OutputStream::try_default()
+        let stream = OutputStreamBuilder::open_default_stream()
             .context("Failed to create audio output stream")?;
         
-        let sink = Arc::new(Sink::try_new(&stream_handle)
-            .context("Failed to create audio sink")?);
+        let mixer = stream.mixer();
+        let sink = Arc::new(Sink::connect_new(&mixer));
 
         // Store stream to keep it alive
         {

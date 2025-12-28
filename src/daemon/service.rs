@@ -4,7 +4,7 @@
 //! Uses channel-based architecture to handle services with non-Send types.
 
 use anyhow::Result;
-use zbus::{interface, ConnectionBuilder, fdo, Message};
+use zbus::{connection, interface, fdo::Error as FdoError, Message};
 use tokio::sync::mpsc;
 use std::time::Duration;
 use std::sync::{Arc, Mutex};
@@ -56,7 +56,8 @@ enum SttRequest {
         pause_duration: f64,
         reply: tokio::sync::oneshot::Sender<Result<String>>,
     },
-    IsListening(tokio::sync::oneshot::Sender<bool>),
+    Stop(tokio::sync::oneshot::Sender<Result<()>>),
+    
 }
 
 impl TtsSttService {
@@ -207,9 +208,32 @@ impl TtsSttService {
                             }.await;
                             let _ = reply.send(result);
                         }
-                        SttRequest::IsListening(reply) => {
-                            let _ = reply.send(stt.is_listening());
+                        SttRequest::Stop(reply) => {
+                            // Emit "processing" status (same as pause detected - decoding/processing)
+                            if let Ok(guard) = status_tx_for_stt.lock() {
+                                if let Some(ref tx) = *guard {
+                                    let _ = tx.send("processing".to_string());
+                                }
+                            }
+                            
+                            // Stop listening and decode
+                            let result = if stt.is_listening() {
+                                let _ = stt.stop_listening(); // Get decoded result
+                                Ok(())
+                            } else {
+                                Ok(())
+                            };
+                            
+                            // Emit "idle" status after stopping
+                            if let Ok(guard) = status_tx_for_stt.lock() {
+                                if let Some(ref tx) = *guard {
+                                    let _ = tx.send("idle".to_string());
+                                }
+                            }
+                            
+                            let _ = reply.send(result);
                         }
+                        
                     }
                 }
             });
@@ -249,7 +273,7 @@ impl TtsSttService {
             *guard = Some(status_tx_internal);
         }
         
-        let connection = ConnectionBuilder::session()?
+        let connection = connection::Builder::session()?
             .name("com.github.digit1024.ttsstt")?
             .serve_at("/com/github/digit1024/ttsstt", service.clone())?
             .build()
@@ -302,67 +326,105 @@ impl Clone for TtsSttService {
     }
 }
 
-#[interface(name = "com.github.digit1024.ttsstt.Service")]
 impl TtsSttService {
+    /// Helper: Cancel/stop TTS operation (ignores errors)
+    async fn cancel_tts(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.tts_tx.send(TtsRequest::Stop(tx));
+        let _ = rx.await; // Ignore errors - just stop if possible
+    }
+
+    /// Helper: Cancel/stop STT operation (ignores errors)
+    async fn cancel_stt(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.stt_tx.send(SttRequest::Stop(tx));
+        let _ = rx.await; // Ignore errors - just cancel if possible
+    }
+}
+
+#[interface(interface = "com.github.digit1024.ttsstt.Service")]
+impl TtsSttService {
+    /// StatusChanged signal
+    /// 
+    /// Emitted when the service status changes. Possible values:
+    /// - "idle" - No operation in progress
+    /// - "speaking" - TTS is currently speaking
+    /// - "listening" - STT is currently listening for audio
+    /// - "processing" - STT is processing/decoding audio
+    /// 
+    /// Note: This signal is emitted manually from worker threads via Message::signal()
+    /// to handle cross-thread signal emission. This declaration ensures it appears in introspection.
+    #[zbus(signal)]
+    async fn status_changed(emitter: &zbus::object_server::SignalEmitter<'_>, status: &str) -> zbus::Result<()>;
+
     /// Text-to-Speech: Convert text to speech
-    async fn tts(&self, text: String, language: String) -> Result<(), fdo::Error> {
+    /// 
+    /// Cancels any ongoing STT operation and stops any previous TTS operation
+    /// before starting the new TTS request.
+    async fn tts(&self, text: String, language: String) -> Result<(), FdoError> {
+        // Cancel any ongoing STT operation and stop any previous TTS
+        self.cancel_stt().await;
+        self.cancel_tts().await;
+        
+        // Now start the new TTS request
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tts_tx
             .send(TtsRequest::Speak { text, language, reply: tx })
-            .map_err(|e| fdo::Error::Failed(format!("TTS channel closed: {}", e)))?;
+            .map_err(|e| FdoError::Failed(format!("TTS channel closed: {}", e)))?;
         
         rx.await
-            .map_err(|e| fdo::Error::Failed(format!("TTS reply channel error: {}", e)))?
-            .map_err(|e| fdo::Error::Failed(format!("TTS failed: {}", e)))?;
+            .map_err(|e| FdoError::Failed(format!("TTS reply channel error: {}", e)))?
+            .map_err(|e| FdoError::Failed(format!("TTS failed: {}", e)))?;
 
         Ok(())
     }
 
     /// Speech-to-Text: Convert speech to text
-    async fn stt(&self, language: String, pause_duration: f64) -> Result<String, fdo::Error> {
-        // Check if already listening
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.stt_tx
-            .send(SttRequest::IsListening(tx))
-            .map_err(|e| fdo::Error::Failed(format!("STT channel closed: {}", e)))?;
-        
-        let is_listening = rx.await
-            .map_err(|e| fdo::Error::Failed(format!("STT reply channel error: {}", e)))?;
-        
-        if is_listening {
-            return Err(fdo::Error::Failed(
-                "STT is already listening. Please wait for the current operation to complete.".to_string(),
-            ));
-        }
+    /// 
+    /// Stops any ongoing TTS operation and cancels any previous STT operation
+    /// before starting the new STT request.
+    async fn stt(&self, language: String, pause_duration: f64) -> Result<String, FdoError> {
+        // Stop any ongoing TTS operation and cancel any previous STT
+        self.cancel_tts().await;
+        self.cancel_stt().await;
 
         // Start listening
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.stt_tx
             .send(SttRequest::StartListening { language, pause_duration, reply: tx })
-            .map_err(|e| fdo::Error::Failed(format!("STT channel closed: {}", e)))?;
+            .map_err(|e| FdoError::Failed(format!("STT channel closed: {}", e)))?;
         
         rx.await
-            .map_err(|e| fdo::Error::Failed(format!("STT reply channel error: {}", e)))?
-            .map_err(|e| fdo::Error::Failed(format!("STT failed: {}", e)))
+            .map_err(|e| FdoError::Failed(format!("STT reply channel error: {}", e)))?
+            .map_err(|e| FdoError::Failed(format!("STT failed: {}", e)))
     }
 
-    /// Stop current playback
-    async fn stop(&self) -> Result<(), fdo::Error> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.tts_tx
-            .send(TtsRequest::Stop(tx))
-            .map_err(|e| fdo::Error::Failed(format!("TTS channel closed: {}", e)))?;
+    /// Stop all operations
+    /// 
+    /// Stops any ongoing TTS playback and any ongoing STT listening operation.
+    /// If STT is listening, it will be stopped and moved to processing/decoding state
+    /// (same as when pause is detected), then to idle after completion.
+    async fn stop(&self) -> Result<(), FdoError> {
+        // Stop TTS (ignore errors)
+        self.cancel_tts().await;
         
-        rx.await
-            .map_err(|e| fdo::Error::Failed(format!("TTS reply channel error: {}", e)))?
-            .map_err(|e| fdo::Error::Failed(format!("Stop failed: {}", e)))?;
+        // Stop STT (will move to processing/decoding, then idle)
+        // Note: We propagate STT stop errors to caller
+        let (tx_stt, rx_stt) = tokio::sync::oneshot::channel();
+        self.stt_tx
+            .send(SttRequest::Stop(tx_stt))
+            .map_err(|e| FdoError::Failed(format!("STT channel closed: {}", e)))?;
+        
+        rx_stt.await
+            .map_err(|e| FdoError::Failed(format!("STT reply channel error: {}", e)))?
+            .map_err(|e| FdoError::Failed(format!("Stop STT failed: {}", e)))?;
 
         Ok(())
     }
 
 
     /// Speech-to-Text Type: Convert speech to text and type it using enigo (X11) or wtype (Wayland)
-    async fn stt_type(&self, language: String, pause_duration: f64) -> Result<(), fdo::Error> {
+    async fn stt_type(&self, language: String, pause_duration: f64) -> Result<(), FdoError> {
         // First, get the text using STT
         let text = self.stt(language, pause_duration).await?;
 
@@ -403,8 +465,8 @@ impl TtsSttService {
             }
         })
         .await
-        .map_err(|e| fdo::Error::Failed(format!("Task join error: {}", e)))?
-        .map_err(|e| fdo::Error::Failed(e))?;
+        .map_err(|e| FdoError::Failed(format!("Task join error: {}", e)))?
+        .map_err(|e| FdoError::Failed(e))?;
 
         Ok(())
     }

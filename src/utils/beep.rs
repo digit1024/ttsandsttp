@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rodio::OutputStreamBuilder;
 use std::io::Cursor;
 
 // Embed beep audio files (paths are relative to source file)
@@ -7,13 +8,13 @@ pub const BEEP_LOW_WAV: &[u8] = include_bytes!("../../beep-low.wav");
 
 /// Internal function that performs the actual audio playback (blocking)
 fn play_beep_internal(wav_data: &'static [u8]) -> Result<()> {
-    use rodio::{Decoder, OutputStream, Sink};
+    use rodio::{Decoder, Sink};
 
-    let (_stream, stream_handle) = OutputStream::try_default()
+    let stream = OutputStreamBuilder::open_default_stream()
         .map_err(|e| anyhow::anyhow!("Failed to create audio output stream: {}", e))?;
 
-    let sink = Sink::try_new(&stream_handle)
-        .map_err(|e| anyhow::anyhow!("Failed to create audio sink: {}", e))?;
+    let mixer = stream.mixer();
+    let sink = Sink::connect_new(&mixer);
 
     let cursor = Cursor::new(wav_data);
     let source = Decoder::new(cursor)

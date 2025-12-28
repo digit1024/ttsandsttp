@@ -7,19 +7,19 @@ edition = "2021"
 sherpa-rs = { version = "0.6", features = ["tts"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
-reqwest = { version = "0.11", features = ["stream"] }
+reqwest = { version = "0.12", features = ["stream"] }
 tar = "0.4"
-bzip2 = "0.4"
-dirs = "5.0"
-indicatif = "0.17"
+bzip2 = "0.6"
+dirs = "6.0"
+indicatif = "0.18"
 bytes = "1.5"
 futures = "0.3"
-rodio = "0.17"
-cpal = "0.15"
-zbus = { version = "4", features = ["tokio"] }
-zvariant = "4"
-enigo = "0.2"
+rodio = "0.21"
+cpal = "0.17"
+zbus = { version = "5", features = ["tokio"] }
+zvariant = "5"
+enigo = "0.6"
 wrtype = "0.1"
-toml = "0.8"
+toml = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
