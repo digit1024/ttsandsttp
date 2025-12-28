@@ -52,4 +52,4 @@ debian/*.log
 *.tar.gz
 *.tar.xz
 *.tar.bz2
-debian/.debhelper/
+debian/.debhelper
