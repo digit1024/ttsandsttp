@@ -58,6 +58,18 @@ impl ModelManager {
             base_path
         }
     }
+    
+    /// Get TTS model path for a specific language and model ID
+    pub fn get_tts_model_path(&self, lang_code: &str, model_id: &str) -> PathBuf {
+        let base = self.models_dir.join("tts").join(lang_code);
+        self.find_actual_model_path(&base, model_id)
+    }
+    
+    /// Get STT/Whisper model path for a specific model ID
+    pub fn get_stt_model_path(&self, model_id: &str) -> PathBuf {
+        let base = self.models_dir.join("whisper").join(model_id);
+        self.find_actual_model_path(&base, model_id)
+    }
 
     /// Ensure models are present, downloading if necessary
     pub async fn ensure_models_present(&self, model_type: &ModelType) -> Result<PathBuf> {
@@ -126,14 +138,10 @@ impl ModelManager {
         })
     }
 
-    /// Download and extract a model
-    async fn download_model(&self, model_type: &ModelType) -> Result<()> {
-        let url = model_type.default_url();
-        let model_name = model_type.default_model_name();
-        let model_path = self.model_path(model_type);
-
+    /// Download and extract a model from URL to destination path
+    async fn download_and_extract(&self, url: &str, extract_to: &Path, filename_hint: &str) -> Result<()> {
         // Create model directory
-        fs::create_dir_all(&model_path)
+        fs::create_dir_all(extract_to)
             .context("Failed to create model directory")?;
 
         // Download the model
@@ -144,17 +152,17 @@ impl ModelManager {
             // Single file download
             let filename = url.split('/').last().unwrap_or("model.onnx");
             let file_path = self.download_file(url, filename).await?;
-            let dest_path = model_path.join(filename);
+            let dest_path = extract_to.join(filename);
             tokio::fs::rename(&file_path, &dest_path)
                 .await
                 .context("Failed to move downloaded file")?;
         } else {
             // Archive download
-            let archive_path = self.download_file(url, &format!("{}.tar.bz2", model_name)).await?;
+            let archive_path = self.download_file(url, &format!("{}.tar.bz2", filename_hint)).await?;
 
             // Extract the archive
             tracing::info!("Extracting model...");
-            self.extract_tarbz2(&archive_path, &model_path).await?;
+            self.extract_tarbz2(&archive_path, extract_to).await?;
 
             // Clean up archive file
             fs::remove_file(&archive_path)
@@ -162,6 +170,14 @@ impl ModelManager {
         }
 
         Ok(())
+    }
+    
+    /// Download and extract a model
+    async fn download_model(&self, model_type: &ModelType) -> Result<()> {
+        let url = model_type.default_url();
+        let model_name = model_type.default_model_name();
+        let model_path = self.model_path(model_type);
+        self.download_and_extract(url, &model_path, model_name).await
     }
 
     /// Download a file with progress bar
@@ -315,34 +331,8 @@ impl ModelManager {
             return Ok(());
         }
 
-        // Create model directory
-        std::fs::create_dir_all(extract_to)
-            .context("Failed to create model directory")?;
-
-        // Download the model
-        tracing::info!("Downloading from: {}", url);
-        
-        // Handle single .onnx files vs tar.bz2 archives
-        if url.ends_with(".onnx") {
-            // Single file download
-            let filename = url.split('/').last().unwrap_or("model.onnx");
-            let file_path = self.download_file(url, filename).await?;
-            let dest_path = extract_to.join(filename);
-            tokio::fs::rename(&file_path, &dest_path)
-                .await
-                .context("Failed to move downloaded file")?;
-        } else {
-            // Archive download
-            let archive_path = self.download_file(url, &format!("{}.tar.bz2", model_id)).await?;
-
-            // Extract the archive
-            tracing::info!("Extracting model...");
-            self.extract_tarbz2(&archive_path, extract_to).await?;
-
-            // Clean up archive file
-            std::fs::remove_file(&archive_path)
-                .context("Failed to remove downloaded archive")?;
-        }
+        // Download and extract using shared logic
+        self.download_and_extract(url, extract_to, model_id).await?;
 
         // Verify files exist (check both direct path and subdirectory)
         let actual_path = self.find_actual_model_path(extract_to, model_id);

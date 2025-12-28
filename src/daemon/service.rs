@@ -3,13 +3,14 @@
 //! Provides a DBus interface for TTS and STT operations.
 //! Uses channel-based architecture to handle services with non-Send types.
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use zbus::{connection, interface, fdo::Error as FdoError, Message};
 use tokio::sync::mpsc;
 use std::time::Duration;
 use std::sync::{Arc, Mutex};
 use wrtype::WrtypeClient;
 
+use crate::config::SharedConfig;
 use crate::services::{SttService, TtsService};
 
 // STT timeout constants
@@ -63,8 +64,21 @@ enum SttRequest {
 }
 
 impl TtsSttService {
+    /// Helper function to emit status updates
+    fn emit_status(status_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>, status: &str) {
+        if let Ok(guard) = status_tx.lock() {
+            if let Some(ref tx) = *guard {
+                let _ = tx.send(status.to_string());
+            }
+        }
+    }
+    
     /// Create a new DBus service instance
     pub fn new() -> Result<Self> {
+        // Load shared config once
+        let shared_config = SharedConfig::load()
+            .context("Failed to load shared configuration")?;
+        
         // Create channel for status updates
         let status_tx = Arc::new(Mutex::new(None::<mpsc::UnboundedSender<String>>));
         let status_tx_clone = Arc::clone(&status_tx);
@@ -72,6 +86,7 @@ impl TtsSttService {
         // Create channels for TTS
         let (tts_tx, mut tts_rx) = mpsc::unbounded_channel();
         let status_tx_for_tts = Arc::clone(&status_tx_clone);
+        let shared_config_for_tts = shared_config.clone();
         
             
         let client = WrtypeClient::new()
@@ -82,7 +97,8 @@ impl TtsSttService {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let tts = TtsService::new().expect("Failed to create TTS service");
+                let tts = TtsService::new_with_config(&shared_config_for_tts)
+                    .expect("Failed to create TTS service");
                 while let Some(req) = tts_rx.recv().await {
                     match req {
                         TtsRequest::Init(reply) => {
@@ -91,11 +107,7 @@ impl TtsSttService {
                         }
                         TtsRequest::Speak { text, language, reply } => {
                             // Emit "speaking" status
-                            if let Ok(guard) = status_tx_for_tts.lock() {
-                                if let Some(ref tx) = *guard {
-                                    let _ = tx.send("speaking".to_string());
-                                }
-                            }
+                            Self::emit_status(&status_tx_for_tts, "speaking");
                             
                             let result = async {
                                 tts.set_language(&language).await?;
@@ -104,11 +116,7 @@ impl TtsSttService {
                             }.await;
                             
                             // Emit "idle" status after speaking completes
-                            if let Ok(guard) = status_tx_for_tts.lock() {
-                                if let Some(ref tx) = *guard {
-                                    let _ = tx.send("idle".to_string());
-                                }
-                            }
+                            Self::emit_status(&status_tx_for_tts, "idle");
                             
                             let _ = reply.send(result);
                         }
@@ -132,28 +140,22 @@ impl TtsSttService {
         // Create channels for STT
         let (stt_tx, mut stt_rx) = mpsc::unbounded_channel();
         let status_tx_for_stt = Arc::clone(&status_tx_clone);
+        let shared_config_for_stt = shared_config.clone();
         
         // Spawn STT handler thread (create service inside thread to avoid Send issues)
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let stt = SttService::new().expect("Failed to create STT service");
+                let stt = SttService::new_with_config(&shared_config_for_stt)
+                    .expect("Failed to create STT service");
                 while let Some(req) = stt_rx.recv().await {
                     match req {
                         SttRequest::Init(reply) => {
                             // Emit "processing" status during initialization
-                            if let Ok(guard) = status_tx_for_stt.lock() {
-                                if let Some(ref tx) = *guard {
-                                    let _ = tx.send("processing".to_string());
-                                }
-                            }
+                            Self::emit_status(&status_tx_for_stt, "processing");
                             let result = stt.init().await;
                             // Emit "idle" status after initialization
-                            if let Ok(guard) = status_tx_for_stt.lock() {
-                                if let Some(ref tx) = *guard {
-                                    let _ = tx.send("idle".to_string());
-                                }
-                            }
+                            Self::emit_status(&status_tx_for_stt, "idle");
                             let _ = reply.send(result);
                         }
                         SttRequest::StartListening { language, pause_duration, reply } => {
@@ -162,22 +164,14 @@ impl TtsSttService {
                             // Emit "processing" status when pause is detected (same time as beep)
                             let status_tx_for_pause = Arc::clone(&status_tx_for_stt);
                             stt.on_pause_detected(move || {
-                                if let Ok(guard) = status_tx_for_pause.lock() {
-                                    if let Some(ref tx) = *guard {
-                                        let _ = tx.send("processing".to_string());
-                                    }
-                                }
+                                Self::emit_status(&status_tx_for_pause, "processing");
                             });
                             stt.on_error(|err| {
                                 tracing::error!("STT Error: {}", err);
                             });
                             
                             // Emit "listening" status
-                            if let Ok(guard) = status_tx_for_stt.lock() {
-                                if let Some(ref tx) = *guard {
-                                    let _ = tx.send("listening".to_string());
-                                }
-                            }
+                            Self::emit_status(&status_tx_for_stt, "listening");
                             
                             let result = async {
                                 stt.start_listening(&language, std::time::Duration::from_secs_f64(pause_duration)).await?;
@@ -192,11 +186,7 @@ impl TtsSttService {
                                         let text = stt.stop_listening()?;
                                         
                                         // Emit "idle" status after processing completes
-                                        if let Ok(guard) = status_tx_for_stt.lock() {
-                                            if let Some(ref tx) = *guard {
-                                                let _ = tx.send("idle".to_string());
-                                            }
-                                        }
+                                        Self::emit_status(&status_tx_for_stt, "idle");
                                         return Ok(text);
                                     }
 
@@ -204,12 +194,8 @@ impl TtsSttService {
                                     if check_count > MAX_STT_TIMEOUT_CHECKS {
                                         let _ = stt.stop_listening();
                                         // Emit "idle" status on timeout
-                                        if let Ok(guard) = status_tx_for_stt.lock() {
-                                            if let Some(ref tx) = *guard {
-                                                let _ = tx.send("idle".to_string());
-                                            }
-                                        }
-                                        anyhow::bail!("STT operation timed out after {}ms", STT_TIMEOUT_MS);
+                                        Self::emit_status(&status_tx_for_stt, "idle");
+                                        bail!("STT operation timed out after {}ms", STT_TIMEOUT_MS);
                                     }
                                 }
                             }.await;
@@ -217,26 +203,17 @@ impl TtsSttService {
                         }
                         SttRequest::Stop(reply) => {
                             // Emit "processing" status (same as pause detected - decoding/processing)
-                            if let Ok(guard) = status_tx_for_stt.lock() {
-                                if let Some(ref tx) = *guard {
-                                    let _ = tx.send("processing".to_string());
-                                }
-                            }
+                            Self::emit_status(&status_tx_for_stt, "processing");
                             
                             // Stop listening and decode
                             let result = if stt.is_listening() {
-                                let _ = stt.stop_listening(); // Get decoded result
-                                Ok(())
+                                stt.stop_listening().map(|_| ()) // Get decoded result, ignore text
                             } else {
                                 Ok(())
                             };
                             
                             // Emit "idle" status after stopping
-                            if let Ok(guard) = status_tx_for_stt.lock() {
-                                if let Some(ref tx) = *guard {
-                                    let _ = tx.send("idle".to_string());
-                                }
-                            }
+                            Self::emit_status(&status_tx_for_stt, "idle");
                             
                             let _ = reply.send(result);
                         }
@@ -258,13 +235,13 @@ impl TtsSttService {
     pub async fn preload_models(&self) -> Result<()> {
         tracing::info!("Preloading TTS models...");
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.tts_tx.send(TtsRequest::Init(tx)).map_err(|e| anyhow::anyhow!("TTS channel closed: {}", e))?;
-        rx.await.map_err(|e| anyhow::anyhow!("TTS init reply channel error: {}", e))??;
+        self.tts_tx.send(TtsRequest::Init(tx)).context("TTS channel closed")?;
+        rx.await.context("TTS init reply channel error")??;
 
         tracing::info!("Preloading STT models...");
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.stt_tx.send(SttRequest::Init(tx)).map_err(|e| anyhow::anyhow!("STT channel closed: {}", e))?;
-        rx.await.map_err(|e| anyhow::anyhow!("STT init reply channel error: {}", e))??;
+        self.stt_tx.send(SttRequest::Init(tx)).context("STT channel closed")?;
+        rx.await.context("STT init reply channel error")??;
 
         tracing::info!("All models preloaded successfully");
         Ok(())
@@ -448,7 +425,8 @@ impl TtsSttService {
         tokio::task::spawn_blocking(move || -> Result<(), String> {
             let mut client_guard = client_arc.lock().unwrap();
             let client = client_guard.as_mut().ok_or("Client not initialized")?;
-            client.type_text_with_delay(&text, Duration::from_millis(10));
+            client.type_text_with_delay(&text, Duration::from_millis(10))
+                .map_err(|e| format!("Failed to type text: {}", e))?;
             
             Ok(())
         })

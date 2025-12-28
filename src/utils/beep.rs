@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rodio::OutputStreamBuilder;
 use std::io::Cursor;
 
@@ -11,14 +11,14 @@ fn play_beep_internal(wav_data: &'static [u8]) -> Result<()> {
     use rodio::{Decoder, Sink};
 
     let stream = OutputStreamBuilder::open_default_stream()
-        .map_err(|e| anyhow::anyhow!("Failed to create audio output stream: {}", e))?;
+        .context("Failed to create audio output stream")?;
 
     let mixer = stream.mixer();
     let sink = Sink::connect_new(&mixer);
 
     let cursor = Cursor::new(wav_data);
     let source = Decoder::new(cursor)
-        .map_err(|e| anyhow::anyhow!("Failed to create audio decoder: {}", e))?;
+        .context("Failed to create audio decoder")?;
 
     sink.append(source);
     sink.sleep_until_end();

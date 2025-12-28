@@ -3,7 +3,7 @@
 //! Provides offline speech recognition using Whisper models from sherpa-rs.
 //! Handles audio capture, pause detection, and transcription.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -13,9 +13,9 @@ use super::audio_utils::{
     calculate_audio_stats, has_sufficient_amplitude, validate_and_clean_audio, TARGET_SAMPLE_RATE,
 };
 use super::pause_detector::PauseDetector;
-use crate::config::{ConfigLoader, ConfigValidator};
+use crate::config::SharedConfig;
 use crate::services::ModelManager;
-use crate::utils::{play_beep, play_beep_blocking, BEEP_HIGH_WAV, BEEP_LOW_WAV};
+use crate::utils::{normalize_language_code, play_beep, play_beep_blocking, BEEP_HIGH_WAV, BEEP_LOW_WAV};
 use tracing;
 
 // Audio processing constants
@@ -28,7 +28,6 @@ const MIN_AMPLITUDE_THRESHOLD: f32 = 0.001;
 /// Provides offline speech recognition using Whisper models.
 /// 
 /// # Features
-/// - Automatic model download and management
 /// - Real-time audio capture from default input device
 /// - Pause detection for automatic transcription
 /// - Callback-based result reporting
@@ -67,8 +66,7 @@ pub struct SttService {
     audio_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     decode_complete_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     decode_complete_rx: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<String>>>>,
-    config: Arc<Mutex<Option<crate::config::AppConfig>>>, // Cached config
-    registry: Arc<Mutex<Option<crate::config::ModelRegistry>>>, // Cached registry
+    shared_config: Arc<SharedConfig>, // Shared config and registry
 }
 
 /// Internal state of the STT service
@@ -137,13 +135,12 @@ impl SttService {
     
     /// Create a new STT service instance
     pub fn new() -> Result<Self> {
+        Self::new_with_config(&SharedConfig::load()?)
+    }
+    
+    /// Create a new STT service instance with shared configuration
+    pub fn new_with_config(shared_config: &SharedConfig) -> Result<Self> {
         let model_manager = ModelManager::new()?;
-        
-        // Load config and registry
-        let config = ConfigLoader::load_or_create()
-            .context("Failed to load config")?;
-        let registry = ConfigValidator::get_registry()
-            .context("Failed to load model registry")?;
         
         Ok(Self {
             recognizer: Arc::new(Mutex::new(None)),
@@ -157,55 +154,33 @@ impl SttService {
             audio_task_handle: Arc::new(Mutex::new(None)),
             decode_complete_tx: Arc::new(Mutex::new(None)),
             decode_complete_rx: Arc::new(Mutex::new(None)),
-            config: Arc::new(Mutex::new(Some(config))),
-            registry: Arc::new(Mutex::new(Some(registry))),
+            shared_config: Arc::new(shared_config.clone()),
         })
     }
     
-    /// Get language code from language string (e.g., "pl" from "pl" or "pl-PL")
-    /// Maps TTS language codes to Whisper language codes
-    fn normalize_language_code(&self, lang: &str) -> String {
-        // Extract base language code (e.g., "pl" from "pl" or "pl-PL")
-        let base_lang = lang.split('-').next().unwrap_or(lang).to_lowercase();
-        
-        // Whisper uses standard language codes, same as TTS
-        // Return the normalized code
-        base_lang
-    }
     
     /// Get Whisper model files based on config
     fn get_whisper_model_files(&self) -> Result<(PathBuf, PathBuf, PathBuf, String)> {
-        let model_id = {
-            let config_guard = self.config.lock().unwrap();
-            let config = config_guard.as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Config not loaded"))?;
-            config.stt.model_id.clone()
-        };
+        let config = self.shared_config.config();
+        let model_id = config.stt.model_id.clone();
         
-        let registry_guard = self.registry.lock().unwrap();
-        let registry = registry_guard.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Registry not loaded"))?;
-        
+        let registry = self.shared_config.registry();
         let model_info = registry.get_stt_model(&model_id)
-            .ok_or_else(|| anyhow::anyhow!("STT model '{}' not found in registry", model_id))?;
+            .with_context(|| format!("STT model '{}' not found in registry", model_id))?;
         
         // Find encoder, decoder, and tokens files
         let encoder_file = model_info.required_files.iter()
             .find(|f| f.contains("encoder") && f.ends_with(".onnx"))
-            .ok_or_else(|| anyhow::anyhow!("No encoder file found for model: {}", model_id))?;
+            .with_context(|| format!("No encoder file found for model: {}", model_id))?;
         let decoder_file = model_info.required_files.iter()
             .find(|f| f.contains("decoder") && f.ends_with(".onnx"))
-            .ok_or_else(|| anyhow::anyhow!("No decoder file found for model: {}", model_id))?;
+            .with_context(|| format!("No decoder file found for model: {}", model_id))?;
         let tokens_file = model_info.required_files.iter()
             .find(|f| f.ends_with("tokens.txt"))
-            .ok_or_else(|| anyhow::anyhow!("No tokens file found for model: {}", model_id))?;
+            .with_context(|| format!("No tokens file found for model: {}", model_id))?;
         
         // Model files are stored in ~/.local/share/stttts/whisper/{model_id}/
-        let models_dir = self.model_manager.models_dir();
-        let model_path = models_dir.join("whisper").join(&model_id);
-        
-        // Handle subdirectories (for archived models)
-        let actual_path = self.model_manager.find_actual_model_path(&model_path, &model_id);
+        let actual_path = self.model_manager.get_stt_model_path(&model_id);
         
         let encoder_path = actual_path.join(encoder_file);
         let decoder_path = actual_path.join(decoder_file);
@@ -218,8 +193,6 @@ impl SttService {
     }
 
     /// Initialize the Whisper STT engine
-    /// 
-    /// This will automatically download Whisper models if they're not present.
     pub async fn init(&self) -> Result<()> {
         {
             let state = self.read_state();
@@ -242,7 +215,7 @@ impl SttService {
         // Store model path
         {
             let model_path = encoder_file.parent()
-                .ok_or_else(|| anyhow::anyhow!("Encoder file has no parent directory"))?;
+                .context("Encoder file has no parent directory")?;
             let mut path_guard = self.model_path.lock().unwrap();
             *path_guard = Some(model_path.to_path_buf());
         }
@@ -262,7 +235,7 @@ impl SttService {
                 }
             } else {
                 // Use current language from state
-                self.normalize_language_code(&current_lang)
+                normalize_language_code(&current_lang)
             }
         };
 
@@ -281,7 +254,7 @@ impl SttService {
 
         // Initialize Whisper recognizer
         let recognizer = sherpa_rs::whisper::WhisperRecognizer::new(config)
-            .map_err(|e| anyhow::anyhow!("Failed to create Whisper recognizer: {}", e))?;
+            .map_err(|e| anyhow::Error::msg(format!("Failed to create Whisper recognizer: {}", e)))?;
 
         {
             let mut recognizer_guard = self.recognizer.lock().unwrap();
@@ -299,7 +272,7 @@ impl SttService {
     
     /// Initialize the Whisper STT engine with a specific language
     pub async fn init_with_language(&self, lang_code: &str) -> Result<()> {
-        let normalized_lang = self.normalize_language_code(lang_code);
+        let normalized_lang = normalize_language_code(lang_code);
         
         // Get Whisper model files from config
         let (encoder_file, decoder_file, tokens_file, model_language) = self.get_whisper_model_files()?;
@@ -332,7 +305,7 @@ impl SttService {
 
         // Initialize Whisper recognizer
         let recognizer = sherpa_rs::whisper::WhisperRecognizer::new(config)
-            .map_err(|e| anyhow::anyhow!("Failed to create Whisper recognizer: {}", e))?;
+            .map_err(|e| anyhow::Error::msg(format!("Failed to create Whisper recognizer: {}", e)))?;
 
         // Replace old recognizer
         {
@@ -358,20 +331,20 @@ impl SttService {
         tokens: &PathBuf,
     ) -> Result<()> {
         if !encoder.exists() {
-            anyhow::bail!("Encoder file not found: {:?}", encoder);
+            bail!("Encoder file not found: {:?}", encoder);
         }
         if !decoder.exists() {
-            anyhow::bail!("Decoder file not found: {:?}", decoder);
+            bail!("Decoder file not found: {:?}", decoder);
         }
         if !tokens.exists() {
-            anyhow::bail!("Tokens file not found: {:?}", tokens);
+            bail!("Tokens file not found: {:?}", tokens);
         }
         Ok(())
     }
 
     /// Start listening for speech (async)
     pub async fn start_listening(&self, lang: &str, pause_duration: Duration) -> Result<()> {
-        let normalized_lang = self.normalize_language_code(lang);
+        let normalized_lang = normalize_language_code(lang);
         
         {
             let state = self.read_state();
@@ -497,12 +470,12 @@ impl SttService {
         let host = cpal::default_host();
         let device = host
             .default_input_device()
-            .ok_or_else(|| anyhow::anyhow!("No input device available"))?;
+            .context("No input device available")?;
 
         // Get default input config
         let config = device
             .default_input_config()
-            .map_err(|e| anyhow::anyhow!("Failed to get input config: {}", e))?;
+            .context("Failed to get input config")?;
 
         let input_sample_rate = config.sample_rate() as u32;
         let channels = config.channels() as usize;
