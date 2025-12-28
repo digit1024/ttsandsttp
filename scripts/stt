@@ -1,0 +1,7 @@
+#!/bin/bash
+dbus-send --session \
+  --dest=com.github.digit1024.ttsstt \
+  --type=method_call \
+  /com/github/digit1024/ttsstt \
+  com.github.digit1024.ttsstt.Service.SttType \
+  string:"en-US" double:2.0
