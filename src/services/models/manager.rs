@@ -9,6 +9,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
+use tracing;
 
 use crate::domain::ModelType;
 
@@ -72,15 +73,15 @@ impl ModelManager {
         // For VAD, check if it's optional and skip if URL doesn't work
         if matches!(model_type, ModelType::Vad) {
             // Try to download, but don't fail if it doesn't work
-            println!("📥 Model '{}' not found, attempting download...", model_name);
+            tracing::info!("Model '{}' not found, attempting download...", model_name);
             if let Err(e) = self.download_model(model_type).await {
-                println!("⚠️  VAD model download failed (optional): {}", e);
-                println!("   STT will work without VAD, but pause detection may be less accurate.");
+                tracing::warn!("VAD model download failed (optional): {}", e);
+                tracing::warn!("STT will work without VAD, but pause detection may be less accurate.");
                 // Return the path anyway - VAD is optional
                 return Ok(model_path);
             }
         } else {
-            println!("📥 Model '{}' not found, downloading...", model_name);
+            tracing::info!("Model '{}' not found, downloading...", model_name);
             self.download_model(model_type).await?;
         }
 
@@ -88,7 +89,7 @@ impl ModelManager {
         if !self.check_model_files(&model_path, model_type) {
             // For VAD, this is okay
             if matches!(model_type, ModelType::Vad) {
-                println!("⚠️  VAD model incomplete (optional)");
+                tracing::warn!("VAD model incomplete (optional)");
                 return Ok(model_path);
             }
             anyhow::bail!(
@@ -97,7 +98,7 @@ impl ModelManager {
             );
         }
 
-        println!("✅ Model '{}' ready", model_name);
+        tracing::info!("Model '{}' ready", model_name);
         Ok(model_path)
     }
 
@@ -136,7 +137,7 @@ impl ModelManager {
             .context("Failed to create model directory")?;
 
         // Download the model
-        println!("⬇️  Downloading from: {}", url);
+        tracing::info!("Downloading from: {}", url);
         
         // Handle single .onnx files (like VAD) vs tar.bz2 archives
         if url.ends_with(".onnx") {
@@ -152,7 +153,7 @@ impl ModelManager {
             let archive_path = self.download_file(url, &format!("{}.tar.bz2", model_name)).await?;
 
             // Extract the archive
-            println!("📦 Extracting model...");
+            tracing::info!("Extracting model...");
             self.extract_tarbz2(&archive_path, &model_path).await?;
 
             // Clean up archive file
@@ -319,7 +320,7 @@ impl ModelManager {
             .context("Failed to create model directory")?;
 
         // Download the model
-        eprintln!("⬇️  Downloading from: {}", url);
+        tracing::info!("Downloading from: {}", url);
         
         // Handle single .onnx files vs tar.bz2 archives
         if url.ends_with(".onnx") {
@@ -335,7 +336,7 @@ impl ModelManager {
             let archive_path = self.download_file(url, &format!("{}.tar.bz2", model_id)).await?;
 
             // Extract the archive
-            eprintln!("📦 Extracting model...");
+            tracing::info!("Extracting model...");
             self.extract_tarbz2(&archive_path, extract_to).await?;
 
             // Clean up archive file

@@ -58,7 +58,7 @@ except Exception as e:
         let stderr = String::from_utf8_lossy(&output.stderr);
         // If onnx is not available, that's okay - the warning is non-fatal
         if stderr.contains("onnx package not available") {
-            eprintln!("⚠️  Python 'onnx' package not available. The warning is non-fatal - model will use default sample_rate (22050 Hz)");
+            tracing::warn!("Python 'onnx' package not available. The warning is non-fatal - model will use default sample_rate (22050 Hz)");
             Ok(())
         } else {
             anyhow::bail!("Failed to add metadata: {}", stderr);

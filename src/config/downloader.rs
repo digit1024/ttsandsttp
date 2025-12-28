@@ -3,6 +3,7 @@
 //! Uses ModelManager to download models specified in the configuration file
 
 use anyhow::{Context, Result};
+use tracing;
 
 use super::models::AppConfig;
 use super::validator::ConfigValidator;
@@ -23,7 +24,7 @@ impl ConfigModelDownloader {
         for (lang_code, lang_config) in &config.tts.languages {
             if lang_config.enabled {
                 if let Some(model_info) = registry.get_tts_model(lang_code, &lang_config.model_id) {
-                    eprintln!("📥 Downloading TTS model for {}: {}", lang_code, model_info.id);
+                    tracing::info!("Downloading TTS model for {}: {}", lang_code, model_info.id);
                     
                     let models_dir = model_manager.models_dir();
                     let model_path = models_dir.join("tts").join(lang_code);
@@ -48,20 +49,20 @@ impl ConfigModelDownloader {
                             if onnx_path.exists() {
                                 // Try to add metadata (non-fatal if it fails)
                                 if let Err(e) = crate::utils::onnx_metadata::add_sample_rate_metadata(&onnx_path, 22050) {
-                                    eprintln!("⚠️  Could not add sample_rate metadata (warning is non-fatal): {}", e);
+                                    tracing::warn!("Could not add sample_rate metadata (warning is non-fatal): {}", e);
                                 }
                             }
                         }
                     }
                     
-                    eprintln!("✅ TTS model for {} ready", lang_code);
+                    tracing::info!("TTS model for {} ready", lang_code);
                 }
             }
         }
 
         // Download STT model
         if let Some(model_info) = registry.get_stt_model(&config.stt.model_id) {
-            eprintln!("📥 Downloading STT model: {}", model_info.id);
+            tracing::info!("Downloading STT model: {}", model_info.id);
             
             let models_dir = model_manager.models_dir();
             let model_path = models_dir.join("whisper").join(&model_info.id);
@@ -76,7 +77,7 @@ impl ConfigModelDownloader {
                 .await
                 .with_context(|| format!("Failed to download STT model: {}", model_info.id))?;
             
-            eprintln!("✅ STT model {} ready", model_info.id);
+            tracing::info!("STT model {} ready", model_info.id);
         }
 
         Ok(())

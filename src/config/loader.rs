@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
 use dirs;
+use tracing;
 
 use super::models::AppConfig;
 
@@ -34,7 +35,7 @@ impl ConfigLoader {
         let config_path = Self::config_path()?;
 
         if !config_path.exists() {
-            eprintln!("📝 Creating default configuration at: {}", config_path.display());
+            tracing::info!("Creating default configuration at: {}", config_path.display());
             Self::create_default_config(&config_path)?;
         }
 
@@ -70,5 +71,6 @@ impl ConfigLoader {
         Ok(())
     }
 }
+
 
 

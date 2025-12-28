@@ -15,7 +15,8 @@ use super::audio_utils::{
 use super::pause_detector::PauseDetector;
 use crate::config::{ConfigLoader, ConfigValidator};
 use crate::services::ModelManager;
-use crate::utils::{format_timestamp, play_beep, play_beep_blocking, BEEP_HIGH_WAV, BEEP_LOW_WAV};
+use crate::utils::{play_beep, play_beep_blocking, BEEP_HIGH_WAV, BEEP_LOW_WAV};
+use tracing;
 
 // Audio processing constants
 const MIN_AUDIO_DURATION: usize = 8000; // 0.5 seconds at 16kHz
@@ -292,7 +293,7 @@ impl SttService {
             state.initialized = true;
         }
 
-        eprintln!("[{}] ✅ Whisper STT initialized", format_timestamp());
+        tracing::info!("Whisper STT initialized");
         Ok(())
     }
     
@@ -346,7 +347,7 @@ impl SttService {
             state.current_language = normalized_lang;
         }
 
-        eprintln!("[{}] ✅ Whisper STT initialized with language: {}", format_timestamp(), language);
+        tracing::info!("Whisper STT initialized with language: {}", language);
         Ok(())
     }
 
@@ -463,15 +464,15 @@ impl SttService {
         // Play high beep in parallel - once it completes, start accumulating samples
         let recording_started_beep = recording_started.clone();
         tokio::spawn(async move {
-            eprintln!("[{}] 🔊 Playing high beep before recording...", format_timestamp());
+            tracing::debug!("Playing high beep before recording...");
             if let Err(e) = play_beep(BEEP_HIGH_WAV).await {
-                eprintln!("[{}] ⚠️  Failed to play high beep: {}", format_timestamp(), e);
+                tracing::warn!("Failed to play high beep: {}", e);
             }
             // Once beep completes, start accumulating samples
             {
                 let mut flag = recording_started_beep.lock().unwrap();
                 *flag = true;
-                eprintln!("[{}] ✅ Recording started (beep completed)", format_timestamp());
+                tracing::info!("Recording started (beep completed)");
             }
         });
 
@@ -528,23 +529,23 @@ impl SttService {
                         }
                     },
                     |err| {
-                        eprintln!("[{}] ❌ Audio input error: {}", format_timestamp(), err);
+                        tracing::error!("Audio input error: {}", err);
                     },
                     None,
                 ) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("[{}] ❌ Failed to build stream: {}", format_timestamp(), e);
+                        tracing::error!("Failed to build stream: {}", e);
                         return;
                     }
                 };
 
                 if let Err(e) = stream.play() {
-                    eprintln!("[{}] ❌ Failed to play stream: {}", format_timestamp(), e);
+                    tracing::error!("Failed to play stream: {}", e);
                     return;
                 }
 
-                eprintln!("[{}] ✅ Audio stream started", format_timestamp());
+                tracing::info!("Audio stream started");
                 
                 // Wait for stop signal or park (park will be used as fallback)
                 // Check stop signal periodically
@@ -558,7 +559,7 @@ impl SttService {
                     std::thread::park_timeout(Duration::from_millis(100));
                 }
                 
-                eprintln!("[{}] ⚠️  Audio stream thread exiting", format_timestamp());
+                tracing::debug!("Audio stream thread exiting");
             });
             
             // Store the thread handle and stop channel
@@ -581,10 +582,7 @@ impl SttService {
             };
 
             if should_stop {
-                eprintln!(
-                    "[{}] 🛑 Audio capture loop stopping",
-                    format_timestamp()
-                );
+                tracing::debug!("Audio capture loop stopping");
 
                 // Decode any accumulated audio before stopping
                 Self::decode_accumulated_audio(
@@ -629,10 +627,7 @@ impl SttService {
                                 Some(true) => {
                                     // Pause detected - stop recording
                                     if accumulated_audio.len() >= MIN_AUDIO_DURATION {
-                                        eprintln!(
-                                            "[{}] ⏸️  Pause detected, stopping recording...",
-                                            format_timestamp(),
-                                        );
+                                        tracing::info!("Pause detected, stopping recording...");
 
                                         // Play low beep immediately (only once) - gives audio feedback that recording stopped
                                         // We play it in a spawned task so it doesn't block decode
@@ -647,17 +642,14 @@ impl SttService {
                                         };
                                         
                                         if should_play_beep {
-                                            eprintln!(
-                                                "[{}] 🔊 Playing low beep after recording stopped...",
-                                                format_timestamp()
-                                            );
+                                            tracing::debug!("Playing low beep after recording stopped...");
                                             // Play beep immediately in background - fire and forget using std::thread
                                             // This gives immediate audio feedback without blocking decode
                                             // Using std::thread instead of tokio::spawn_blocking to avoid thread pool delays
                                             let beep_data = BEEP_LOW_WAV;
                                             std::thread::spawn(move || {
                                                 if let Err(e) = play_beep_blocking(beep_data) {
-                                                    eprintln!("[{}] ⚠️  Failed to play low beep: {}", format_timestamp(), e);
+                                                    tracing::warn!("Failed to play low beep: {}", e);
                                                 }
                                             });
                                         }
@@ -671,11 +663,7 @@ impl SttService {
                                         }
 
                                         // Now decode the accumulated audio (this can take time)
-                                        eprintln!(
-                                            "[{}] 🔍 Decoding {} samples...",
-                                            format_timestamp(),
-                                            accumulated_audio.len()
-                                        );
+                                        tracing::debug!("Decoding {} samples...", accumulated_audio.len());
                                         Self::decode_accumulated_audio(
                                             &recognizer,
                                             &result_callback,
@@ -692,7 +680,7 @@ impl SttService {
                                             state_guard.listening = false;
                                         }
 
-                                        eprintln!("[{}] 🛑 Stopping due to pause detection", format_timestamp());
+                                        tracing::info!("Stopping due to pause detection");
 
                                         // Signal the audio thread to stop
                                         {
@@ -723,10 +711,10 @@ impl SttService {
 
                         if !first_sample_received {
                             first_sample_received = true;
-                            eprintln!("[{}] ✅ Audio capture confirmed (stream active, waiting for beep...)", format_timestamp());
+                            tracing::info!("Audio capture confirmed (stream active, waiting for beep...)");
                         }
                     } else {
-                        eprintln!("[{}] ⚠️  Audio channel closed", format_timestamp());
+                        tracing::warn!("Audio channel closed");
                         break;
                     }
                 }
@@ -761,13 +749,12 @@ impl SttService {
         error_callback: &Arc<Mutex<Option<Box<dyn Fn(String) + Send + Sync>>>>,
     ) {
         if !first_sample_received && last_sample_time.elapsed() > AUDIO_TIMEOUT {
-            let ts = format_timestamp();
             let error_msg = format!(
-                "⚠️  WARNING: No audio samples received after {} seconds. Audio capture may not be working!",
+                "WARNING: No audio samples received after {} seconds. Audio capture may not be working!",
                 AUDIO_TIMEOUT.as_secs()
             );
-            eprintln!("[{}] {}", ts, error_msg);
-            eprintln!("[{}]    Check: Is your microphone enabled? Is the audio device working?", ts);
+            tracing::warn!("{}", error_msg);
+            tracing::warn!("Check: Is your microphone enabled? Is the audio device working?");
 
             let error_cb = error_callback.lock().unwrap();
             if let Some(ref cb) = *error_cb {
@@ -785,9 +772,8 @@ impl SttService {
         decode_complete_tx: &Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     ) {
         if accumulated_audio.len() < MIN_AUDIO_DURATION {
-            eprintln!(
-                "[{}] ⚠️  Not enough accumulated audio ({} < {} samples), skipping decode",
-                format_timestamp(),
+            tracing::warn!(
+                "Not enough accumulated audio ({} < {} samples), skipping decode",
                 accumulated_audio.len(),
                 MIN_AUDIO_DURATION
             );
@@ -797,9 +783,8 @@ impl SttService {
         // Validate audio has sufficient amplitude
         if !has_sufficient_amplitude(accumulated_audio, MIN_AMPLITUDE_THRESHOLD) {
             let stats = calculate_audio_stats(accumulated_audio);
-            eprintln!(
-                "[{}] ⚠️  Accumulated audio is too quiet (max_abs={:.6}), skipping decode",
-                format_timestamp(),
+            tracing::warn!(
+                "Accumulated audio is too quiet (max_abs={:.6}), skipping decode",
                 stats.max_abs
             );
             return;
@@ -811,17 +796,13 @@ impl SttService {
         // Validate and clean audio
         let validation_stats = validate_and_clean_audio(&mut audio_to_decode);
         if validation_stats.has_invalid {
-            eprintln!(
-                "[{}] ⚠️  Found invalid samples (NaN/Inf), cleaned them",
-                format_timestamp()
-            );
+            tracing::warn!("Found invalid samples (NaN/Inf), cleaned them");
         }
 
         // Log audio stats
         let stats = calculate_audio_stats(&audio_to_decode);
-        eprintln!(
-            "[{}] 🔍 Decoding {} samples ({:.2}s) at {}Hz...",
-            format_timestamp(),
+        tracing::debug!(
+            "Decoding {} samples ({:.2}s) at {}Hz...",
             stats.sample_count,
             stats.sample_count as f32 / TARGET_SAMPLE_RATE as f32,
             TARGET_SAMPLE_RATE
@@ -830,11 +811,7 @@ impl SttService {
         // Skip decode if environment variable is set (for testing)
         let skip_decode = std::env::var("SKIP_DECODE").is_ok();
         if skip_decode {
-            eprintln!(
-                "[{}] ⏭️  SKIP_DECODE: Would decode {} samples",
-                format_timestamp(),
-                audio_to_decode.len()
-            );
+            tracing::debug!("SKIP_DECODE: Would decode {} samples", audio_to_decode.len());
             return;
         }
 
@@ -851,9 +828,8 @@ impl SttService {
         };
 
         let decode_duration = decode_start.elapsed();
-        eprintln!(
-            "[{}] ✅ Decode completed: '{}' (took {:.3}s)",
-            format_timestamp(),
+        tracing::info!(
+            "Decode completed: '{}' (took {:.3}s)",
             if text.is_empty() { "(empty)" } else { &text },
             decode_duration.as_secs_f64()
         );
@@ -885,7 +861,7 @@ impl SttService {
 
     /// Stop listening and return the recognized text
     pub fn stop_listening(&self) -> Result<String> {
-        eprintln!("[{}] 🔍 stop_listening() called", format_timestamp());
+        tracing::debug!("stop_listening() called");
         let was_listening = {
             let state = self.read_state();
             state.listening
@@ -894,11 +870,11 @@ impl SttService {
         let mut state = self.write_state();
 
         if !state.listening {
-            eprintln!("[{}] 🔍 Already stopped, returning current text", format_timestamp());
+            tracing::debug!("Already stopped, returning current text");
             return Ok(state.current_text.clone());
         }
 
-        eprintln!("[{}] 🔍 Setting listening=false", format_timestamp());
+        tracing::debug!("Setting listening=false");
         state.listening = false;
         drop(state);
 
@@ -909,12 +885,9 @@ impl SttService {
                 state_guard.beep_played = true;
                 drop(state_guard);
                 
-                eprintln!(
-                    "[{}] 🔊 Playing low beep after recording stopped...",
-                    format_timestamp()
-                );
+                tracing::debug!("Playing low beep after recording stopped...");
                 if let Err(e) = play_beep_blocking(BEEP_LOW_WAV) {
-                    eprintln!("[{}] ⚠️  Failed to play low beep: {}", format_timestamp(), e);
+                    tracing::warn!("Failed to play low beep: {}", e);
                 }
             }
         }
@@ -949,10 +922,7 @@ impl SttService {
                         tokio::time::timeout(Duration::from_secs(5), rx).await
                     }) {
                         Ok(Ok(result)) => {
-                            eprintln!(
-                                "[{}] 🔍 stop_listening() received decode result via channel",
-                                format_timestamp()
-                            );
+                            tracing::debug!("stop_listening() received decode result via channel");
                             result
                         }
                         Ok(Err(_)) => {
@@ -962,10 +932,7 @@ impl SttService {
                         }
                         Err(_) => {
                             // Timeout - get text from state
-                            eprintln!(
-                                "[{}] 🔍 stop_listening() decode timeout, using state text",
-                                format_timestamp()
-                            );
+                            tracing::debug!("stop_listening() decode timeout, using state text");
                             let state = self.read_state();
                             state.current_text.clone()
                         }
@@ -996,13 +963,12 @@ impl SttService {
             let mut recognizer_guard = self.recognizer.lock().unwrap();
             if let Some(recognizer) = recognizer_guard.take() {
                 drop(recognizer);
-                eprintln!("[{}] 🔧 WhisperRecognizer dropped", format_timestamp());
+                tracing::debug!("WhisperRecognizer dropped");
             }
         }
 
-        eprintln!(
-            "[{}] 🔍 stop_listening() returning text: '{}'",
-            format_timestamp(),
+        tracing::debug!(
+            "stop_listening() returning text: '{}'",
             if text.is_empty() { "(empty)" } else { &text }
         );
         Ok(text)

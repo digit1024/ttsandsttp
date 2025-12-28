@@ -4,8 +4,7 @@
 //! Used to automatically trigger transcription when the user stops speaking.
 
 use std::time::{Duration, Instant};
-
-use crate::utils::format_timestamp;
+use tracing;
 
 // Audio processing constants
 const AUDIO_ACTIVITY_THRESHOLD: f32 = 0.01; // Threshold for detecting speech
@@ -50,11 +49,7 @@ impl PauseDetector {
             self.silence_start = None;
             if !self.has_detected_speech {
                 self.has_detected_speech = true;
-                eprintln!(
-                    "[{}] 🎤 Speech detected (amplitude: {:.4})",
-                    format_timestamp(),
-                    max_abs
-                );
+                tracing::debug!("Speech detected (amplitude: {:.4})", max_abs);
             }
             Some(false) // Continue recording
         } else if has_activity {
@@ -62,11 +57,7 @@ impl PauseDetector {
             if !self.has_detected_speech {
                 self.has_detected_speech = true;
                 self.silence_start = None; // Reset silence on first activity
-                eprintln!(
-                    "[{}] 🎤 Audio activity detected (amplitude: {:.4})",
-                    format_timestamp(),
-                    max_abs
-                );
+                tracing::debug!("Audio activity detected (amplitude: {:.4})", max_abs);
             }
             // If we already detected speech, low activity doesn't reset silence
             Some(false) // Continue recording
@@ -81,9 +72,8 @@ impl PauseDetector {
                 if let Some(silence_start_time) = self.silence_start {
                     let silence_duration = silence_start_time.elapsed();
                     if silence_duration > self.pause_duration {
-                        eprintln!(
-                            "[{}] ⏸️  Pause detected: {:.2}s of silence",
-                            format_timestamp(),
+                        tracing::info!(
+                            "Pause detected: {:.2}s of silence",
                             silence_duration.as_secs_f64()
                         );
                         return Some(true); // Pause detected - should stop

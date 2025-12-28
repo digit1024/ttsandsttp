@@ -8,6 +8,7 @@ use zbus::{connection, interface, fdo::Error as FdoError, Message};
 use tokio::sync::mpsc;
 use std::time::Duration;
 use std::sync::{Arc, Mutex};
+use wrtype::WrtypeClient;
 
 use crate::services::{SttService, TtsService};
 
@@ -37,6 +38,7 @@ pub struct TtsSttService {
     tts_tx: mpsc::UnboundedSender<TtsRequest>,
     stt_tx: mpsc::UnboundedSender<SttRequest>,
     status_tx: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
+    client: Arc<Mutex<Option<WrtypeClient>>>,
 }
 
 enum TtsRequest {
@@ -70,6 +72,11 @@ impl TtsSttService {
         // Create channels for TTS
         let (tts_tx, mut tts_rx) = mpsc::unbounded_channel();
         let status_tx_for_tts = Arc::clone(&status_tx_clone);
+        
+            
+        let client = WrtypeClient::new()
+            .expect("Failed to create wrtype client");
+        
         
         // Spawn TTS handler thread (create service inside thread to avoid Send issues)
         std::thread::spawn(move || {
@@ -162,7 +169,7 @@ impl TtsSttService {
                                 }
                             });
                             stt.on_error(|err| {
-                                eprintln!("❌ STT Error: {}", err);
+                                tracing::error!("STT Error: {}", err);
                             });
                             
                             // Emit "listening" status
@@ -243,22 +250,23 @@ impl TtsSttService {
             tts_tx, 
             stt_tx,
             status_tx: status_tx_clone,
+            client: Arc::new(Mutex::new(Some(client))),
         })
     }
 
     /// Initialize and preload both TTS and STT models
     pub async fn preload_models(&self) -> Result<()> {
-        println!("📦 Preloading TTS models...");
+        tracing::info!("Preloading TTS models...");
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tts_tx.send(TtsRequest::Init(tx)).map_err(|e| anyhow::anyhow!("TTS channel closed: {}", e))?;
         rx.await.map_err(|e| anyhow::anyhow!("TTS init reply channel error: {}", e))??;
 
-        println!("📦 Preloading STT models...");
+        tracing::info!("Preloading STT models...");
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.stt_tx.send(SttRequest::Init(tx)).map_err(|e| anyhow::anyhow!("STT channel closed: {}", e))?;
         rx.await.map_err(|e| anyhow::anyhow!("STT init reply channel error: {}", e))??;
 
-        println!("✅ All models preloaded successfully");
+        tracing::info!("All models preloaded successfully");
         Ok(())
     }
 
@@ -293,21 +301,21 @@ impl TtsSttService {
                 match message_result {
                     Ok(message) => {
                         if let Err(e) = connection.send(&message).await {
-                            eprintln!("⚠️  Failed to send StatusChanged signal: {}", e);
+                            tracing::warn!("Failed to send StatusChanged signal: {}", e);
                         }
                     }
                     Err(e) => {
-                        eprintln!("⚠️  Failed to build StatusChanged signal: {}", e);
+                        tracing::warn!("Failed to build StatusChanged signal: {}", e);
                     }
                 }
             }
         });
 
-        println!("✅ DBus service started");
-        println!("   Service: com.github.digit1024.ttsstt");
-        println!("   Object: /com/github/digit1024/ttsstt");
-        println!("   Interface: com.github.digit1024.ttsstt.Service");
-        println!("   Waiting for requests...");
+        tracing::info!("DBus service started");
+        tracing::info!("   Service: com.github.digit1024.ttsstt");
+        tracing::info!("   Object: /com/github/digit1024/ttsstt");
+        tracing::info!("   Interface: com.github.digit1024.ttsstt.Service");
+        tracing::info!("   Waiting for requests...");
 
         // Keep the connection alive
         loop {
@@ -322,6 +330,7 @@ impl Clone for TtsSttService {
             tts_tx: self.tts_tx.clone(),
             stt_tx: self.stt_tx.clone(),
             status_tx: Arc::clone(&self.status_tx),
+            client: Arc::clone(&self.client),
         }
     }
 }
@@ -423,7 +432,7 @@ impl TtsSttService {
     }
 
 
-    /// Speech-to-Text Type: Convert speech to text and type it using enigo (X11) or wtype (Wayland)
+    /// Speech-to-Text Type: Convert speech to text and type it character-by-character using wrtype
     async fn stt_type(&self, language: String, pause_duration: f64) -> Result<(), FdoError> {
         // First, get the text using STT
         let text = self.stt(language, pause_duration).await?;
@@ -432,37 +441,16 @@ impl TtsSttService {
             return Ok(()); // Nothing to type
         }
 
-        // Detect display server and use appropriate typing method
-        let wayland_display = std::env::var("WAYLAND_DISPLAY").is_ok();
-        let x11_display = std::env::var("DISPLAY").is_ok() && !wayland_display;
+        // Clone the client Arc before moving into the closure
+        let client_arc = Arc::clone(&self.client);
 
-        // Type the text using appropriate method
+        // Type the text character-by-character using wrtype
         tokio::task::spawn_blocking(move || -> Result<(), String> {
-            if wayland_display {
-                // Use wrtype Rust library for Wayland (handles spaces properly)
-                use wrtype::WrtypeClient;
-                
-                let mut client = WrtypeClient::new()
-                    .map_err(|e| format!("Failed to create wrtype client: {}", e))?;
-                
-                client.type_text(&text)
-                    .map_err(|e| format!("Failed to type text with wrtype: {}", e))?;
-                
-                Ok(())
-            } else if x11_display {
-                // Use enigo for X11
-                use enigo::Keyboard;
-                let settings = enigo::Settings::default();
-                let mut enigo = enigo::Enigo::new(&settings)
-                    .map_err(|e| format!("Failed to create enigo: {}", e))?;
-                for ch in text.chars() {
-                    enigo.key(enigo::Key::Unicode(ch), enigo::Direction::Press)
-                        .map_err(|e| format!("Failed to type character: {}", e))?;
-                }
-                Ok(())
-            } else {
-                Err("Neither WAYLAND_DISPLAY nor DISPLAY environment variables are set. Cannot determine display server.".to_string())
-            }
+            let mut client_guard = client_arc.lock().unwrap();
+            let client = client_guard.as_mut().ok_or("Client not initialized")?;
+            client.type_text_with_delay(&text, Duration::from_millis(10));
+            
+            Ok(())
         })
         .await
         .map_err(|e| FdoError::Failed(format!("Task join error: {}", e)))?

@@ -3,6 +3,7 @@
 //! Handles audio preprocessing: stereo-to-mono conversion and resampling.
 
 use super::audio_utils::{resample_linear, stereo_to_mono, TARGET_SAMPLE_RATE};
+use tracing;
 
 /// Audio Processor
 ///
@@ -21,9 +22,8 @@ impl AudioProcessor {
         let needs_resampling = input_sample_rate != TARGET_SAMPLE_RATE;
         
         if needs_resampling {
-            eprintln!(
-                "[{}] ⚠️  Audio input is {}Hz, resampling to {}Hz",
-                crate::utils::format_timestamp(),
+            tracing::warn!(
+                "Audio input is {}Hz, resampling to {}Hz",
                 input_sample_rate,
                 TARGET_SAMPLE_RATE
             );
