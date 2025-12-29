@@ -6,10 +6,11 @@
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use rayon::prelude::*;
 
 use crate::config::SharedConfig;
 use crate::services::ModelManager;
-use crate::utils::{create_wav_buffer, normalize_language_code};
+use crate::utils::{DirectSampleSource, normalize_language_code, split_into_sentences};
 
 /// Text-to-Speech Service
 ///
@@ -198,7 +199,25 @@ impl TtsService {
         self.init_with_language(&default_lang).await
     }
 
-    /// Speak the given text (async)
+    /// Ensure audio stream is ready (pre-create if needed)
+    fn ensure_audio_stream(&self) -> Result<()> {
+        use rodio::{OutputStreamBuilder, Sink};
+        
+        let mut stream_guard = self._stream.lock().unwrap();
+        if stream_guard.is_none() {
+            let stream = OutputStreamBuilder::open_default_stream()
+                .context("Failed to create audio output stream")?;
+            let mixer = stream.mixer();
+            let sink = Arc::new(Sink::connect_new(&mixer));
+            
+            *stream_guard = Some(stream);
+            let mut sink_guard = self.sink.lock().unwrap();
+            *sink_guard = Some(sink);
+        }
+        Ok(())
+    }
+
+    /// Speak the given text (async) with chunking/streaming optimization
     pub async fn speak(&self, text: &str) -> Result<()> {
         {
             let state = self.read_state();
@@ -216,26 +235,30 @@ impl TtsService {
             self.init_with_language(&current_lang).await?;
         }
 
+        // Pre-create audio stream before generation (optimization #2)
+        self.ensure_audio_stream()?;
+
         {
             let mut state = self.write_state();
             state.playing = true;
         }
 
-        // Generate audio from text
-        let audio = {
-            let mut engine_guard = self.engine.lock().unwrap();
-            if let Some(ref mut engine) = *engine_guard {
-                // create(text, speaker_id, speed)
-                // speaker_id: 0 for default, speed: 1.0 for normal
-                engine.create(text, 0, 1.0)
-                    .map_err(|e| anyhow::Error::msg(format!("TTS generation failed: {}", e)))?
-            } else {
-                bail!("TTS engine not initialized");
-            }
-        };
+        // Split text into sentences for chunking (optimization #1)
+        let sentences = split_into_sentences(text);
+        
+        if sentences.is_empty() {
+            let mut state = self.write_state();
+            state.playing = false;
+            return Ok(());
+        }
 
-        // Play audio using rodio
-        self.play_audio(&audio).await?;
+        // For single sentence or very short text, use simple path
+        if sentences.len() == 1 && text.len() < 200 {
+            return self.speak_simple(&sentences[0]).await;
+        }
+
+        // Chunked/streaming path for longer text
+        self.speak_chunked(&sentences).await?;
 
         {
             let mut state = self.write_state();
@@ -245,52 +268,146 @@ impl TtsService {
         Ok(())
     }
 
-    /// Play audio samples using rodio
-    async fn play_audio(&self, audio: &sherpa_rs::tts::TtsAudio) -> Result<()> {
-        use rodio::{Decoder, OutputStreamBuilder, Sink};
-        use std::io::Cursor;
+    /// Simple speak path for short text (no chunking overhead)
+    async fn speak_simple(&self, text: &str) -> Result<()> {
+        // Generate audio from text
+        let audio = {
+            let mut engine_guard = self.engine.lock().unwrap();
+            if let Some(ref mut engine) = *engine_guard {
+                engine.create(text, 0, 1.0)
+                    .map_err(|e| anyhow::Error::msg(format!("TTS generation failed: {}", e)))?
+            } else {
+                bail!("TTS engine not initialized");
+            }
+        };
 
-        // Create output stream and sink
-        let stream = OutputStreamBuilder::open_default_stream()
-            .context("Failed to create audio output stream")?;
-        
-        let mixer = stream.mixer();
-        let sink = Arc::new(Sink::connect_new(&mixer));
+        // Play audio using rodio
+        self.play_audio_direct(&audio).await?;
 
-        // Store stream to keep it alive
         {
-            let mut stream_guard = self._stream.lock().unwrap();
-            *stream_guard = Some(stream);
+            let mut state = self.write_state();
+            state.playing = false;
         }
         
-        // Convert f32 samples to i16 for rodio
-        // TtsAudio has samples: Vec<f32> and sample_rate: u32
-        let samples_i16: Vec<i16> = audio.samples
-            .iter()
+        Ok(())
+    }
+
+    /// Chunked/streaming speak path - generates and plays chunks in parallel
+    async fn speak_chunked(&self, sentences: &[String]) -> Result<()> {
+        use tokio::sync::mpsc;
+
+        // Get or create sink
+        let sink = {
+            let sink_guard = self.sink.lock().unwrap();
+            sink_guard.clone().ok_or_else(|| anyhow::anyhow!("Audio sink not available"))?
+        };
+
+        // Channel for sending generated audio chunks
+        let (tx, mut rx) = mpsc::unbounded_channel::<(Vec<i16>, u32)>();
+
+        let engine = Arc::clone(&self.engine);
+        let sentences_clone: Vec<String> = sentences.iter().cloned().collect();
+        
+        // Generate first chunk immediately and start playing
+        let first_sentence = sentences_clone[0].clone();
+        let first_audio = {
+            let mut engine_guard = self.engine.lock().unwrap();
+            if let Some(ref mut eng) = *engine_guard {
+                eng.create(&first_sentence, 0, 1.0)
+                    .map_err(|e| anyhow::Error::msg(format!("TTS generation failed: {}", e)))?
+            } else {
+                bail!("TTS engine not initialized");
+            }
+        };
+
+        // Start playing first chunk immediately (this is the key optimization!)
+        let first_samples = self.convert_samples_parallel(&first_audio.samples);
+        self.append_audio_to_sink(&sink, first_samples, first_audio.sample_rate)?;
+
+        // Generate remaining chunks in background and queue them
+        if sentences_clone.len() > 1 {
+            let remaining_sentences = sentences_clone[1..].to_vec();
+            let tx_clone = tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut engine_guard = engine.lock().unwrap();
+                if let Some(ref mut eng) = *engine_guard {
+                    for sentence in remaining_sentences {
+                        match eng.create(&sentence, 0, 1.0) {
+                            Ok(audio) => {
+                                // Convert samples in parallel
+                                let samples_i16: Vec<i16> = audio.samples
+                                    .par_iter()
+                                    .map(|&sample| {
+                                        let clamped = sample.max(-1.0).min(1.0);
+                                        (clamped * i16::MAX as f32) as i16
+                                    })
+                                    .collect();
+                                
+                                if tx_clone.send((samples_i16, audio.sample_rate)).is_err() {
+                                    break; // Receiver dropped
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to generate chunk: {}", e);
+                                // Continue with next chunk
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Close the sender so receiver knows when to stop
+        drop(tx);
+
+        // Play queued chunks as they arrive (streaming playback)
+        while let Some((samples, sample_rate)) = rx.recv().await {
+            self.append_audio_to_sink(&sink, samples, sample_rate)?;
+        }
+
+        // Wait for all playback to complete
+        let sink_for_wait = sink.clone();
+        tokio::task::spawn_blocking(move || {
+            sink_for_wait.sleep_until_end();
+        }).await?;
+
+        Ok(())
+    }
+
+    /// Convert f32 samples to i16 using parallel processing (optimization #4)
+    fn convert_samples_parallel(&self, samples: &[f32]) -> Vec<i16> {
+        samples
+            .par_iter()
             .map(|&sample| {
-                // Clamp to [-1.0, 1.0] and convert to i16
                 let clamped = sample.max(-1.0).min(1.0);
                 (clamped * i16::MAX as f32) as i16
             })
-            .collect();
+            .collect()
+    }
 
-        // Create a source from the samples
-        // We need to create a custom source or use a buffer
-        // For simplicity, we'll write to a WAV buffer and decode it
-        let wav_buffer = create_wav_buffer(&samples_i16, audio.sample_rate)?;
-        
-        let cursor = Cursor::new(wav_buffer);
-        let source = Decoder::new(cursor)
-            .context("Failed to create audio decoder")?;
-
-        // Append to sink and store it
+    /// Append audio directly to sink without WAV encoding (optimization #3)
+    fn append_audio_to_sink(&self, sink: &Arc<rodio::Sink>, samples: Vec<i16>, sample_rate: u32) -> Result<()> {
+        let source = DirectSampleSource::new(samples, sample_rate);
         sink.append(source);
-        {
-            let mut sink_guard = self.sink.lock().unwrap();
-            *sink_guard = Some(sink.clone());
-        }
-        
-        // Wait for playback to complete (blocking call, run in blocking task)
+        Ok(())
+    }
+
+    /// Play audio samples using rodio (direct, no WAV encoding)
+    async fn play_audio_direct(&self, audio: &sherpa_rs::tts::TtsAudio) -> Result<()> {
+
+        // Get or create sink
+        let sink = {
+            let sink_guard = self.sink.lock().unwrap();
+            sink_guard.clone().ok_or_else(|| anyhow::anyhow!("Audio sink not available"))?
+        };
+
+        // Convert samples using parallel processing (optimization #4)
+        let samples_i16 = self.convert_samples_parallel(&audio.samples);
+
+        // Append directly without WAV encoding (optimization #3)
+        self.append_audio_to_sink(&sink, samples_i16, audio.sample_rate)?;
+
+        // Wait for playback to complete
         let sink_for_wait = sink.clone();
         tokio::task::spawn_blocking(move || {
             sink_for_wait.sleep_until_end();
