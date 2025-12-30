@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 sherpa-rs = { version = "0.6", features = ["tts"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 anyhow = "1.0"
 reqwest = { version = "0.12", features = ["stream"] }
 tar = "0.4"

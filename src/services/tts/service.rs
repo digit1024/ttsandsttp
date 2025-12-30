@@ -6,7 +6,10 @@
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 use rayon::prelude::*;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::SharedConfig;
 use crate::services::ModelManager;
@@ -40,6 +43,8 @@ pub struct TtsService {
     _stream: Arc<Mutex<Option<rodio::OutputStream>>>, // Keep stream alive
     sink: Arc<Mutex<Option<Arc<rodio::Sink>>>>, // For audio playback
     shared_config: Arc<SharedConfig>, // Shared config and registry
+    cancellation_token: Arc<Mutex<Option<CancellationToken>>>, // For immediate cancellation
+    generation_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>, // Background generation task
 }
 
 #[derive(Clone, Debug)]
@@ -80,7 +85,7 @@ impl TtsService {
     /// Create a new TTS service instance with shared configuration
     pub fn new_with_config(shared_config: &SharedConfig) -> Result<Self> {
         let model_manager = ModelManager::new()?;
-        
+
         Ok(Self {
             engine: Arc::new(Mutex::new(None)),
             state: Arc::new(RwLock::new(TtsState::default())),
@@ -89,6 +94,8 @@ impl TtsService {
             _stream: Arc::new(Mutex::new(None)),
             sink: Arc::new(Mutex::new(None)),
             shared_config: Arc::new(shared_config.clone()),
+            cancellation_token: Arc::new(Mutex::new(None)),
+            generation_task: Arc::new(Mutex::new(None)),
         })
     }
     
@@ -258,18 +265,34 @@ impl TtsService {
         }
 
         // Chunked/streaming path for longer text
-        self.speak_chunked(&sentences).await?;
+        let result = self.speak_chunked(&sentences).await;
 
+        // Always reset playing state
         {
             let mut state = self.write_state();
             state.playing = false;
         }
-        
-        Ok(())
+
+        // Clear cancellation token on completion
+        {
+            let mut token_guard = self.cancellation_token.lock().unwrap();
+            token_guard.take();
+        }
+
+        result
     }
 
-    /// Simple speak path for short text (no chunking overhead)
+    /// Simple speak path for short text (no chunking overhead) with cancellation support
     async fn speak_simple(&self, text: &str) -> Result<()> {
+        tracing::debug!("Starting simple TTS generation for text: '{}'", text);
+
+        // Create cancellation token for this generation session
+        let cancellation_token = CancellationToken::new();
+        {
+            let mut token_guard = self.cancellation_token.lock().unwrap();
+            *token_guard = Some(cancellation_token.clone());
+        }
+
         // Generate audio from text
         let audio = {
             let mut engine_guard = self.engine.lock().unwrap();
@@ -281,20 +304,35 @@ impl TtsService {
             }
         };
 
-        // Play audio using rodio
-        self.play_audio_direct(&audio).await?;
+        // Play audio using rodio with cancellation support
+        let result = self.play_audio_direct_with_cancellation(&audio, cancellation_token).await;
 
+        // Always reset playing state
         {
             let mut state = self.write_state();
             state.playing = false;
         }
-        
-        Ok(())
+
+        // Clear cancellation token on completion
+        {
+            let mut token_guard = self.cancellation_token.lock().unwrap();
+            token_guard.take();
+        }
+
+        tracing::debug!("Simple TTS generation completed");
+        result
     }
 
-    /// Chunked/streaming speak path - generates and plays chunks in parallel
+    /// Chunked/streaming speak path - generates and plays chunks in parallel with cancellation support
     async fn speak_chunked(&self, sentences: &[String]) -> Result<()> {
-        use tokio::sync::mpsc;
+        tracing::debug!("Starting chunked TTS generation for {} sentences", sentences.len());
+
+        // Create cancellation token for this generation session
+        let cancellation_token = CancellationToken::new();
+        {
+            let mut token_guard = self.cancellation_token.lock().unwrap();
+            *token_guard = Some(cancellation_token.clone());
+        }
 
         // Get or create sink
         let sink = {
@@ -307,7 +345,7 @@ impl TtsService {
 
         let engine = Arc::clone(&self.engine);
         let sentences_clone: Vec<String> = sentences.iter().cloned().collect();
-        
+
         // Generate first chunk immediately and start playing
         let first_sentence = sentences_clone[0].clone();
         let first_audio = {
@@ -324,14 +362,28 @@ impl TtsService {
         let first_samples = self.convert_samples_parallel(&first_audio.samples);
         self.append_audio_to_sink(&sink, first_samples, first_audio.sample_rate)?;
 
-        // Generate remaining chunks in background and queue them
+        // Generate remaining chunks in background with cancellation support
         if sentences_clone.len() > 1 {
             let remaining_sentences = sentences_clone[1..].to_vec();
             let tx_clone = tx.clone();
-            tokio::task::spawn_blocking(move || {
+            let cancellation_token_clone = cancellation_token.clone();
+
+            let generation_task = tokio::spawn(async move {
                 let mut engine_guard = engine.lock().unwrap();
                 if let Some(ref mut eng) = *engine_guard {
                     for sentence in remaining_sentences {
+                        // Check for cancellation before each generation
+                        if cancellation_token_clone.is_cancelled() {
+                            tracing::debug!("Generation task cancelled - stopping generation");
+                            break;
+                        }
+
+                        // Also check cancellation before sending to channel
+                        if cancellation_token_clone.is_cancelled() {
+                            tracing::debug!("Generation task cancelled before sending chunk");
+                            break;
+                        }
+
                         match eng.create(&sentence, 0, 1.0) {
                             Ok(audio) => {
                                 // Convert samples in parallel
@@ -342,8 +394,15 @@ impl TtsService {
                                         (clamped * i16::MAX as f32) as i16
                                     })
                                     .collect();
+
+                                // Check cancellation again before sending
+                                if cancellation_token_clone.is_cancelled() {
+                                    tracing::debug!("Generation task cancelled before sending chunk");
+                                    break;
+                                }
                                 
                                 if tx_clone.send((samples_i16, audio.sample_rate)).is_err() {
+                                    tracing::debug!("Channel closed, stopping generation");
                                     break; // Receiver dropped
                                 }
                             }
@@ -355,22 +414,136 @@ impl TtsService {
                     }
                 }
             });
+
+            // Store the task handle
+            {
+                let mut task_guard = self.generation_task.lock().unwrap();
+                *task_guard = Some(generation_task);
+            }
         }
 
         // Close the sender so receiver knows when to stop
         drop(tx);
 
-        // Play queued chunks as they arrive (streaming playback)
-        while let Some((samples, sample_rate)) = rx.recv().await {
-            self.append_audio_to_sink(&sink, samples, sample_rate)?;
+        // Play queued chunks as they arrive (streaming playback) with cancellation
+        // CRITICAL: Check cancellation BEFORE each append, as append might block
+        let sink_clone = sink.clone();
+        let cancellation_token_for_playback = cancellation_token.clone();
+        let mut playback_task = tokio::spawn(async move {
+            while let Some((samples, sample_rate)) = rx.recv().await {
+                // Check cancellation BEFORE appending (append might block synchronously)
+                if cancellation_token_for_playback.is_cancelled() {
+                    tracing::debug!("Cancellation detected in playback task, stopping");
+                    sink_clone.stop();
+                    return;
+                }
+                
+                // Append chunk to sink - sink will queue it and play it
+                // NOTE: This might block if sink is full, so we check cancellation first
+                let source = DirectSampleSource::new(samples, sample_rate);
+                sink_clone.append(source);
+            }
+            tracing::debug!("Playback task completed (all chunks received)");
+        });
+
+        // Wait for playback to complete with cancellation support
+        let playback_completed = tokio::select! {
+            result = &mut playback_task => {
+                match result {
+                    Ok(()) => tracing::debug!("Playback completed normally"),
+                    Err(e) => tracing::warn!("Playback task failed: {}", e),
+                }
+                true
+            }
+            _ = cancellation_token.cancelled() => {
+                tracing::debug!("Playback cancelled");
+                false
+            }
+        };
+
+        // If playback was cancelled, abort the task and stop sink immediately
+        if !playback_completed {
+            playback_task.abort();
+            // Stop sink synchronously - rodio playback is synchronous
+            sink.stop();
+            // Small synchronous wait to ensure stop takes effect
+            std::thread::sleep(Duration::from_millis(10));
+            // Clear the sink to ensure no audio continues
+            {
+                let mut sink_guard = self.sink.lock().unwrap();
+                *sink_guard = None;
+            }
+            tracing::debug!("Playback stopped immediately due to cancellation");
+            return Ok(());
         }
 
-        // Wait for all playback to complete
-        let sink_for_wait = sink.clone();
-        tokio::task::spawn_blocking(move || {
-            sink_for_wait.sleep_until_end();
-        }).await?;
+        // Use async polling instead of blocking sleep_until_end()
+        // This allows immediate cancellation and makes the function fully async
+        // Check cancellation VERY frequently (every 1ms) for instant response
+        let sink_for_poll = sink.clone();
+        let cancellation_token_poll = cancellation_token.clone();
+        
+        // Spawn a task that continuously checks cancellation and sink status
+        let poll_task = tokio::spawn(async move {
+            loop {
+                // Check cancellation FIRST - highest priority
+                if cancellation_token_poll.is_cancelled() {
+                    tracing::debug!("Cancellation detected in poll task, stopping sink");
+                    // Stop sink synchronously - rodio playback is synchronous
+                    sink_for_poll.stop();
+                    std::thread::sleep(Duration::from_millis(10)); // Ensure stop takes effect
+                    return;
+                }
+                
+                // Check if sink is empty (non-blocking)
+                if sink_for_poll.empty() {
+                    // Double-check after a tiny delay, but check cancellation during wait
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                            if sink_for_poll.empty() {
+                                tracing::debug!("All audio playback completed");
+                                return;
+                            }
+                        }
+                        _ = cancellation_token_poll.cancelled() => {
+                            tracing::debug!("Cancellation during empty check, stopping sink");
+                            // Stop sink synchronously - rodio playback is synchronous
+                            sink_for_poll.stop();
+                            std::thread::sleep(Duration::from_millis(10)); // Ensure stop takes effect
+                            return;
+                        }
+                    }
+                } else {
+                    // Sleep very briefly before next check (1ms for instant cancellation response)
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        });
+        
+        // Clone handle before select so we can abort if needed
+        let poll_task_abort = poll_task.abort_handle();
+        
+        // Wait for poll task with cancellation support
+        tokio::select! {
+            _ = poll_task => {
+                tracing::debug!("Poll task completed");
+            }
+            _ = cancellation_token.cancelled() => {
+                tracing::debug!("Cancellation received, stopping sink and aborting poll");
+                // Stop sink synchronously - rodio playback is synchronous
+                sink.stop();
+                std::thread::sleep(Duration::from_millis(10)); // Ensure stop takes effect
+                poll_task_abort.abort();
+            }
+        }
 
+        // Clear stored task handle
+        {
+            let mut task_guard = self.generation_task.lock().unwrap();
+            task_guard.take();
+        }
+
+        tracing::info!("Chunked TTS generation completed");
         Ok(())
     }
 
@@ -394,6 +567,14 @@ impl TtsService {
 
     /// Play audio samples using rodio (direct, no WAV encoding)
     async fn play_audio_direct(&self, audio: &sherpa_rs::tts::TtsAudio) -> Result<()> {
+        // Use default cancellation token for backward compatibility
+        let cancellation_token = CancellationToken::new();
+        self.play_audio_direct_with_cancellation(audio, cancellation_token).await
+    }
+
+    /// Play audio samples using rodio with cancellation support
+    async fn play_audio_direct_with_cancellation(&self, audio: &sherpa_rs::tts::TtsAudio, cancellation_token: CancellationToken) -> Result<()> {
+        tracing::debug!("Starting audio playback with cancellation support");
 
         // Get or create sink
         let sink = {
@@ -407,32 +588,176 @@ impl TtsService {
         // Append directly without WAV encoding (optimization #3)
         self.append_audio_to_sink(&sink, samples_i16, audio.sample_rate)?;
 
-        // Wait for playback to complete
-        let sink_for_wait = sink.clone();
-        tokio::task::spawn_blocking(move || {
-            sink_for_wait.sleep_until_end();
-        }).await?;
+        // Use async polling instead of blocking sleep_until_end()
+        // This allows immediate cancellation and makes the function fully async
+        let sink_for_poll = sink.clone();
+        let cancellation_token_poll = cancellation_token.clone();
+        
+        // Spawn a task that continuously checks cancellation and sink status
+        let poll_task = tokio::spawn(async move {
+            loop {
+                // Check cancellation FIRST - highest priority
+                if cancellation_token_poll.is_cancelled() {
+                    tracing::debug!("Cancellation detected in poll task, stopping sink");
+                    // Stop sink synchronously - rodio playback is synchronous
+                    sink_for_poll.stop();
+                    std::thread::sleep(Duration::from_millis(10)); // Ensure stop takes effect
+                    return;
+                }
+                
+                // Check if sink is empty (non-blocking)
+                if sink_for_poll.empty() {
+                    // Double-check after a tiny delay, but check cancellation during wait
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                            if sink_for_poll.empty() {
+                                tracing::debug!("Audio playback completed normally");
+                                return;
+                            }
+                        }
+                        _ = cancellation_token_poll.cancelled() => {
+                            tracing::debug!("Cancellation during empty check, stopping sink");
+                            // Stop sink synchronously - rodio playback is synchronous
+                            sink_for_poll.stop();
+                            std::thread::sleep(Duration::from_millis(10)); // Ensure stop takes effect
+                            return;
+                        }
+                    }
+                } else {
+                    // Sleep very briefly before next check (1ms for instant cancellation response)
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        });
+        
+        // Clone handle before select so we can abort if needed
+        let poll_task_abort = poll_task.abort_handle();
+        
+        // Wait for poll task with cancellation support
+        tokio::select! {
+            _ = poll_task => {
+                tracing::debug!("Poll task completed");
+            }
+            _ = cancellation_token.cancelled() => {
+                tracing::debug!("Cancellation received, stopping sink and aborting poll");
+                // Stop sink synchronously - rodio playback is synchronous
+                sink.stop();
+                std::thread::sleep(Duration::from_millis(10)); // Ensure stop takes effect
+                poll_task_abort.abort();
+            }
+        }
 
         Ok(())
     }
 
 
-    /// Stop current speech
+    /// Stop current speech immediately with cancellation
+    /// 
+    /// This method MUST return quickly (< 100ms) to avoid timeout in daemon.
+    /// It does NOT wait for tasks to complete - it just cancels and stops.
     pub fn stop(&self) -> Result<()> {
+        tracing::debug!("TTS stop requested");
+
         let mut state = self.write_state();
-        
+
         if !state.playing {
+            tracing::debug!("TTS not playing, nothing to stop");
             return Ok(());
         }
 
-        // Stop audio playback
+        // Set playing to false immediately to prevent new operations
+        state.playing = false;
+        drop(state);
+
+        // Cancel cancellation token first to interrupt any waiting operations
+        // This is fast and non-blocking
+        {
+            let mut token_guard = self.cancellation_token.lock().unwrap();
+            if let Some(token) = token_guard.take() {
+                token.cancel();
+                tracing::debug!("Cancellation token triggered");
+            }
+        }
+
+        // Stop audio playback IMMEDIATELY - this kills playback in the middle of a sentence
+        // CRITICAL: When we clone the sink with Arc, all clones point to the SAME sink
+        // But the REAL driver is the STREAM - dropping the stream stops ALL sinks immediately
+        // So we drop the stream FIRST, which invalidates all sinks and stops playback instantly
+        
+        // First, stop the sink (affects all Arc clones since they share the same sink)
         let mut sink_guard = self.sink.lock().unwrap();
         if let Some(ref sink) = *sink_guard {
+            tracing::debug!("Stopping audio sink (affects all Arc clones)");
             sink.stop();
         }
         *sink_guard = None;
+        drop(sink_guard);
+        
+        // CRITICAL: Drop the stream FIRST - this is what actually drives audio playback
+        // Dropping the stream invalidates ALL sinks immediately, stopping playback instantly
+        // This is the nuclear option that works even if Arc clones are still holding sinks
+        let mut stream_guard = self._stream.lock().unwrap();
+        *stream_guard = None;
+        drop(stream_guard);
+        
+        tracing::debug!("Stream dropped - all sinks (including Arc clones) are now invalid, playback stopped");
 
-        state.playing = false;
+        // Cancel any ongoing generation task (non-blocking, don't wait)
+        // We don't wait for it to complete - just cancel the token and let it finish in background
+        {
+            let mut task_guard = self.generation_task.lock().unwrap();
+            if let Some(task) = task_guard.take() {
+                task.abort(); // Abort immediately, don't wait
+            }
+        }
+
+        tracing::info!("TTS stopped successfully (playback killed immediately)");
+        Ok(())
+    }
+
+    /// Cancel any ongoing generation task with timeout
+    fn cancel_generation_task(&self) -> Result<()> {
+        tracing::debug!("Cancelling TTS generation task");
+
+        // Cancel via token first
+        {
+            let mut token_guard = self.cancellation_token.lock().unwrap();
+            if let Some(token) = token_guard.take() {
+                token.cancel();
+                tracing::debug!("Cancellation token triggered");
+            }
+        }
+
+        // Wait for task completion with timeout
+        let mut task_guard = self.generation_task.lock().unwrap();
+        if let Some(task) = task_guard.take() {
+            tracing::debug!("Waiting for generation task to complete...");
+            let rt = tokio::runtime::Handle::try_current();
+            match rt {
+                Ok(handle) => {
+                    // In async context, use timeout
+                    match handle.block_on(async {
+                        tokio::time::timeout(Duration::from_millis(500), task).await
+                    }) {
+                        Ok(Ok(())) => tracing::debug!("Generation task completed gracefully"),
+                        Ok(Err(e)) => tracing::warn!("Generation task failed: {}", e),
+                        Err(_) => tracing::warn!("Generation task timeout, dropping"),
+                    }
+                }
+                Err(_) => {
+                    // Not in async context, create runtime
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    match rt.block_on(async {
+                        tokio::time::timeout(Duration::from_millis(500), task).await
+                    }) {
+                        Ok(Ok(())) => tracing::debug!("Generation task completed gracefully"),
+                        Ok(Err(e)) => tracing::warn!("Generation task failed: {}", e),
+                        Err(_) => tracing::warn!("Generation task timeout, dropping"),
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 

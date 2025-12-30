@@ -3056,6 +3056,7 @@ dependencies = [
  "sherpa-rs",
  "tar",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",

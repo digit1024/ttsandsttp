@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 use super::audio_processor::AudioProcessor;
 use super::audio_utils::{
@@ -67,6 +68,7 @@ pub struct SttService {
     decode_complete_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
     decode_complete_rx: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<String>>>>,
     shared_config: Arc<SharedConfig>, // Shared config and registry
+    cancellation_token: Arc<Mutex<Option<CancellationToken>>>, // For immediate cancellation
 }
 
 /// Internal state of the STT service
@@ -155,6 +157,7 @@ impl SttService {
             decode_complete_tx: Arc::new(Mutex::new(None)),
             decode_complete_rx: Arc::new(Mutex::new(None)),
             shared_config: Arc::new(shared_config.clone()),
+            cancellation_token: Arc::new(Mutex::new(None)),
         })
     }
     
@@ -381,6 +384,13 @@ impl SttService {
             state.beep_played = false; // Reset beep flag for new recording session
         }
 
+        // Create cancellation token for this listening session
+        let cancellation_token = CancellationToken::new();
+        {
+            let mut token_guard = self.cancellation_token.lock().unwrap();
+            *token_guard = Some(cancellation_token.clone());
+        }
+
         // Create a flag to control when recording actually starts (after beep completes)
         let recording_started = Arc::new(Mutex::new(false));
 
@@ -394,6 +404,7 @@ impl SttService {
         let audio_task_handle = self.audio_task_handle.clone();
         let pause_duration = pause_duration;
         let recording_started_clone = recording_started.clone();
+        let cancellation_token_clone = cancellation_token.clone();
 
         // Create channel for decode completion signal
         let (decode_tx, decode_rx) = tokio::sync::oneshot::channel();
@@ -418,6 +429,7 @@ impl SttService {
                 pause_duration,
                 recording_started_clone,
                 decode_complete_tx_clone,
+                cancellation_token_clone,
             )
             .await
             {
@@ -452,7 +464,7 @@ impl SttService {
         Ok(())
     }
 
-    /// Audio capture loop - handles audio input and recognition
+    /// Audio capture loop - handles audio input and recognition with cancellation support
     async fn audio_capture_loop(
         recognizer: Arc<Mutex<Option<sherpa_rs::whisper::WhisperRecognizer>>>,
         result_callback: Arc<Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>>>,
@@ -463,6 +475,7 @@ impl SttService {
         pause_duration: Duration,
         recording_started: Arc<Mutex<bool>>,
         decode_complete_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+        cancellation_token: CancellationToken,
     ) -> Result<()> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -581,6 +594,23 @@ impl SttService {
             }
 
             tokio::select! {
+                // Check for cancellation
+                _ = cancellation_token.cancelled() => {
+                    tracing::debug!("Audio capture cancelled via token");
+
+                    // Signal the audio thread to stop immediately
+                    {
+                        let handle_guard = audio_thread_handle.lock().unwrap();
+                        if let Some((ref thread, ref stop_tx)) = *handle_guard {
+                            let _ = stop_tx.send(());
+                            thread.unpark();
+                        }
+                    }
+
+                    // Don't decode accumulated audio on cancellation
+                    tracing::info!("Audio capture cancelled, discarding accumulated audio");
+                    break;
+                }
                 // Receive audio samples
                 samples = sample_rx.recv() => {
                     if let Some(new_samples) = samples {
@@ -594,7 +624,7 @@ impl SttService {
                         if should_accumulate {
                             // Process audio: convert to mono and resample
                             let processed_samples = audio_processor.process(new_samples);
-                            
+
                             // Check for pause detection
                             match pause_detector.process_samples(&processed_samples) {
                                 Some(true) => {
@@ -613,7 +643,7 @@ impl SttService {
                                                 false
                                             }
                                         };
-                                        
+
                                         if should_play_beep {
                                             tracing::debug!("Playing low beep after recording stopped...");
                                             // Play beep immediately in background - fire and forget using std::thread
@@ -832,24 +862,50 @@ impl SttService {
         }
     }
 
-    /// Stop listening and return the recognized text
+    /// Stop listening and return the recognized text with immediate cancellation
     pub fn stop_listening(&self) -> Result<String> {
         tracing::debug!("stop_listening() called");
+
+        // Trigger immediate cancellation first
+        self.cancel_listening()?;
+
+        // Wait for decode to complete with timeout
+        let text = self.wait_for_decode_with_timeout(Duration::from_secs(2))?;
+
+        tracing::debug!(
+            "stop_listening() returning text: '{}'",
+            if text.is_empty() { "(empty)" } else { &text }
+        );
+        Ok(text)
+    }
+
+    /// Cancel listening immediately without waiting for decode
+    pub fn cancel_listening(&self) -> Result<()> {
+        tracing::debug!("Cancelling STT listening immediately");
+
         let was_listening = {
             let state = self.read_state();
             state.listening
         };
 
-        let mut state = self.write_state();
-
-        if !state.listening {
-            tracing::debug!("Already stopped, returning current text");
-            return Ok(state.current_text.clone());
+        // Update state first
+        {
+            let mut state = self.write_state();
+            if !state.listening {
+                tracing::debug!("Already stopped");
+                return Ok(());
+            }
+            state.listening = false;
         }
 
-        tracing::debug!("Setting listening=false");
-        state.listening = false;
-        drop(state);
+        // Trigger cancellation token for immediate interruption
+        {
+            let mut token_guard = self.cancellation_token.lock().unwrap();
+            if let Some(token) = token_guard.take() {
+                token.cancel();
+                tracing::debug!("Cancellation token triggered");
+            }
+        }
 
         // Play low beep if we were actually listening and beep hasn't been played yet
         if was_listening {
@@ -857,7 +913,7 @@ impl SttService {
             if !state_guard.beep_played {
                 state_guard.beep_played = true;
                 drop(state_guard);
-                
+
                 tracing::debug!("Playing low beep after recording stopped...");
                 if let Err(e) = play_beep_blocking(BEEP_LOW_WAV) {
                     tracing::warn!("Failed to play low beep: {}", e);
@@ -865,62 +921,44 @@ impl SttService {
             }
         }
 
-        // Signal the audio thread to stop
+        // Signal the audio thread to stop immediately
         {
             let handle_guard = self.audio_thread_handle.lock().unwrap();
             if let Some((ref thread, ref stop_tx)) = *handle_guard {
                 let _ = stop_tx.send(());
                 thread.unpark();
+                tracing::debug!("Audio thread stop signal sent");
             }
         }
-        
-        // Clear the task handle - the task will complete when audio_capture_loop returns
-        // Note: We can't await here since this is a sync function, but dropping the handle
-        // will allow the task to be cleaned up when it completes
-        {
-            let mut handle_guard = self.audio_task_handle.lock().unwrap();
-            handle_guard.take();
-        }
-        
+
+        Ok(())
+    }
+
+    /// Wait for decode completion with timeout
+    fn wait_for_decode_with_timeout(&self, timeout: Duration) -> Result<String> {
+        tracing::debug!("Waiting for decode completion with {:?} timeout", timeout);
+
         // Wait for decode to complete using async coordination (with timeout)
-        // The decode happens asynchronously in the audio loop
         let text = {
             let mut rx_guard = self.decode_complete_rx.lock().unwrap();
             if let Some(rx) = rx_guard.take() {
                 // Use blocking wait with timeout
-                let handle = tokio::runtime::Handle::try_current();
-                if let Ok(handle) = handle {
-                    // We're in an async context, use timeout
-                    match handle.block_on(async {
-                        tokio::time::timeout(Duration::from_secs(5), rx).await
-                    }) {
-                        Ok(Ok(result)) => {
-                            tracing::debug!("stop_listening() received decode result via channel");
-                            result
-                        }
-                        Ok(Err(_)) => {
-                            // Channel was closed, get text from state
-                            let state = self.read_state();
-                            state.current_text.clone()
-                        }
-                        Err(_) => {
-                            // Timeout - get text from state
-                            tracing::debug!("stop_listening() decode timeout, using state text");
-                            let state = self.read_state();
-                            state.current_text.clone()
-                        }
+                // Spawn a new thread to run the Tokio runtime to avoid nested runtime issues
+                match std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+                    rt.block_on(async {
+                        tokio::time::timeout(timeout, rx).await
+                    })
+                }).join() {
+                    Ok(Ok(Ok(text))) => {
+                        tracing::debug!("Received decode result via channel");
+                        text
                     }
-                } else {
-                    // Not in async context, use blocking wait
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    match rt.block_on(async {
-                        tokio::time::timeout(Duration::from_secs(5), rx).await
-                    }) {
-                        Ok(Ok(result)) => result,
-                        _ => {
-                            let state = self.read_state();
-                            state.current_text.clone()
-                        }
+                    Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
+                        // Channel was closed, timeout, or thread panic - get text from state
+                        tracing::debug!("Decode timeout, channel closed, or thread panic, using state text");
+                        let state = self.read_state();
+                        state.current_text.clone()
                     }
                 }
             } else {
@@ -930,8 +968,8 @@ impl SttService {
             }
         };
 
-        // Drop the recognizer AFTER decode completes
-        // This ensures sherpa-rs resources are cleaned up after decode is done
+        // Drop the recognizer AFTER decode completes or timeout
+        // This ensures sherpa-rs resources are cleaned up
         {
             let mut recognizer_guard = self.recognizer.lock().unwrap();
             if let Some(recognizer) = recognizer_guard.take() {
@@ -940,24 +978,19 @@ impl SttService {
             }
         }
 
-        tracing::debug!(
-            "stop_listening() returning text: '{}'",
-            if text.is_empty() { "(empty)" } else { &text }
-        );
+        // Clear the task handle
+        {
+            let mut handle_guard = self.audio_task_handle.lock().unwrap();
+            handle_guard.take();
+        }
+
         Ok(text)
     }
 
-    /// Cancel listening without returning text
+    /// Cancel listening without returning text (legacy method, uses new cancellation)
     pub fn cancel(&self) -> Result<()> {
-        let mut state = self.write_state();
-
-        if !state.listening {
-            return Ok(());
-        }
-
-        state.listening = false;
-        state.current_text.clear();
-        Ok(())
+        tracing::debug!("Legacy cancel() called, using new cancellation mechanism");
+        self.cancel_listening()
     }
 
     /// Set callback for partial results

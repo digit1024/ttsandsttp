@@ -40,6 +40,8 @@ pub struct TtsSttService {
     stt_tx: mpsc::UnboundedSender<SttRequest>,
     status_tx: Arc<Mutex<Option<mpsc::UnboundedSender<String>>>>,
     client: Arc<Mutex<Option<WrtypeClient>>>,
+    // Shared cancellation channel for interrupting speak()
+    speak_cancel_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>>,
 }
 
 enum TtsRequest {
@@ -59,7 +61,7 @@ enum SttRequest {
         pause_duration: f64,
         reply: tokio::sync::oneshot::Sender<Result<String>>,
     },
-    Stop(tokio::sync::oneshot::Sender<Result<()>>),
+    Stop(tokio::sync::oneshot::Sender<Result<String>>),
     
 }
 
@@ -88,10 +90,13 @@ impl TtsSttService {
         let status_tx_for_tts = Arc::clone(&status_tx_clone);
         let shared_config_for_tts = shared_config.clone();
         
-            
+        // Create shared cancellation channel for interrupting speak()
+        // This allows stop() to interrupt speak() even while it's blocking
+        let speak_cancel_tx = Arc::new(Mutex::new(None::<tokio::sync::mpsc::UnboundedSender<()>>));
+        let speak_cancel_tx_clone = Arc::clone(&speak_cancel_tx);
+        
         let client = WrtypeClient::new()
             .expect("Failed to create wrtype client");
-        
         
         // Spawn TTS handler thread (create service inside thread to avoid Send issues)
         std::thread::spawn(move || {
@@ -106,29 +111,92 @@ impl TtsSttService {
                             let _ = reply.send(result);
                         }
                         TtsRequest::Speak { text, language, reply } => {
+                            // CRITICAL: If there's already a speak() in progress, cancel it first
+                            // This ensures new TTS requests immediately stop the previous one
+                            let had_previous_speak = {
+                                let mut guard = speak_cancel_tx_clone.lock().unwrap();
+                                if let Some(prev_cancel_tx) = guard.take() {
+                                    tracing::debug!("New TTS request - cancelling previous speak() immediately");
+                                    let _ = prev_cancel_tx.send(()); // Cancel previous speak()
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            
+                            // If we cancelled a previous speak(), also stop TTS service and wait a bit
+                            if had_previous_speak {
+                                tracing::debug!("Stopping TTS service to ensure previous playback stops");
+                                let _ = tts.stop();
+                                // Small delay to ensure previous speak() cleanup completes
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                            
                             // Emit "speaking" status
                             Self::emit_status(&status_tx_for_tts, "speaking");
                             
-                            let result = async {
+                            // Create cancellation channel for this speak operation
+                            let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                            
+                            // Store cancel sender so stop() can interrupt this speak()
+                            {
+                                let mut guard = speak_cancel_tx_clone.lock().unwrap();
+                                *guard = Some(cancel_tx);
+                            }
+                            
+                            let speak_future = async {
                                 tts.set_language(&language).await?;
                                 tts.speak(&text).await?;
                                 Ok::<(), anyhow::Error>(())
-                            }.await;
+                            };
                             
-                            // Emit "idle" status after speaking completes
+                            // Use select to allow stop() to interrupt speak()
+                            let result = tokio::select! {
+                                res = speak_future => {
+                                    // Clear cancel sender
+                                    {
+                                        let mut guard = speak_cancel_tx_clone.lock().unwrap();
+                                        *guard = None;
+                                    }
+                                    res
+                                }
+                                _ = cancel_rx.recv() => {
+                                    // Stop was called - interrupt speak immediately
+                                    tracing::debug!("Speak interrupted by stop request - stopping TTS immediately");
+                                    // Stop the TTS immediately
+                                    let _ = tts.stop();
+                                    // Clear cancel sender
+                                    {
+                                        let mut guard = speak_cancel_tx_clone.lock().unwrap();
+                                        *guard = None;
+                                    }
+                                    Err(anyhow::anyhow!("TTS stopped"))
+                                }
+                            };
+                            
+                            // Emit "idle" status after speaking completes (or is stopped)
                             Self::emit_status(&status_tx_for_tts, "idle");
                             
                             let _ = reply.send(result);
                         }
                         TtsRequest::Stop(reply) => {
-                            let result = tts.stop();
+                            // Stop immediately - interrupt any ongoing speak()
+                            tracing::debug!("Stop request received - interrupting speak() if running");
                             
-                            // Emit "idle" status after stopping
-                            if let Ok(guard) = status_tx_for_tts.lock() {
-                                if let Some(ref tx) = *guard {
-                                    let _ = tx.send("idle".to_string());
+                            // First, try to interrupt speak() via cancellation channel
+                            {
+                                let mut guard = speak_cancel_tx_clone.lock().unwrap();
+                                if let Some(cancel_tx) = guard.take() {
+                                    let _ = cancel_tx.send(());
+                                    tracing::debug!("Sent cancellation signal to interrupt speak()");
                                 }
                             }
+                            
+                            // Also stop the TTS service directly
+                            let result = tts.stop();
+                            
+                            // Don't emit "idle" here - let the next operation emit its state
+                            // This prevents "idle" from being emitted between "processing" and "speaking"
                             
                             let _ = reply.send(result);
                         }
@@ -205,15 +273,16 @@ impl TtsSttService {
                             // Emit "processing" status (same as pause detected - decoding/processing)
                             Self::emit_status(&status_tx_for_stt, "processing");
                             
-                            // Stop listening and decode
+                            // Stop listening and decode, return the recognized text
                             let result = if stt.is_listening() {
-                                stt.stop_listening().map(|_| ()) // Get decoded result, ignore text
+                                stt.stop_listening() // Returns Result<String>
                             } else {
-                                Ok(())
+                                // Not listening, return current text or empty string
+                                Ok(stt.current_text().clone())
                             };
                             
-                            // Emit "idle" status after stopping
-                            Self::emit_status(&status_tx_for_stt, "idle");
+                            // Don't emit "idle" here - let the next operation emit its state
+                            // This prevents "idle" from being emitted between "processing" and "speaking"
                             
                             let _ = reply.send(result);
                         }
@@ -228,6 +297,7 @@ impl TtsSttService {
             stt_tx,
             status_tx: status_tx_clone,
             client: Arc::new(Mutex::new(Some(client))),
+            speak_cancel_tx: speak_cancel_tx,
         })
     }
 
@@ -308,23 +378,70 @@ impl Clone for TtsSttService {
             stt_tx: self.stt_tx.clone(),
             status_tx: Arc::clone(&self.status_tx),
             client: Arc::clone(&self.client),
+            speak_cancel_tx: Arc::clone(&self.speak_cancel_tx),
         }
     }
 }
 
 impl TtsSttService {
-    /// Helper: Cancel/stop TTS operation (ignores errors)
+    /// Helper: Cancel/stop TTS operation with proper error handling and logging
     async fn cancel_tts(&self) {
+        tracing::debug!("Daemon: Cancelling TTS operation");
+        
+        // First, try to interrupt speak() immediately via cancellation channel
+        // This works even if speak() is currently blocking
+        {
+            let mut guard = self.speak_cancel_tx.lock().unwrap();
+            if let Some(cancel_tx) = guard.take() {
+                let _ = cancel_tx.send(());
+                tracing::debug!("Sent immediate cancellation signal to interrupt speak()");
+            }
+        }
+        
+        // Also send stop request to TTS thread
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.tts_tx.send(TtsRequest::Stop(tx));
-        let _ = rx.await; // Ignore errors - just stop if possible
+        if let Err(e) = self.tts_tx.send(TtsRequest::Stop(tx)) {
+            tracing::warn!("Failed to send TTS stop request: {}", e);
+            return;
+        }
+
+        // Don't wait for reply - we've already interrupted speak() via cancellation channel
+        // The stop request will be processed when speak() is interrupted
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), rx).await;
+        tracing::debug!("TTS stop signal sent (speak() should be interrupted)");
     }
 
-    /// Helper: Cancel/stop STT operation (ignores errors)
+    /// Helper: Cancel/stop STT operation with proper error handling and logging
     async fn cancel_stt(&self) {
+        tracing::debug!("Daemon: Cancelling STT operation");
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.stt_tx.send(SttRequest::Stop(tx));
-        let _ = rx.await; // Ignore errors - just cancel if possible
+        if let Err(e) = self.stt_tx.send(SttRequest::Stop(tx)) {
+            tracing::warn!("Failed to send STT stop request: {}", e);
+            return;
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx).await {
+            Ok(Ok(result)) => {
+                match result {
+                    Ok(text) => {
+                        if !text.is_empty() {
+                            tracing::debug!("STT stopped with text: '{}'", text);
+                        } else {
+                            tracing::debug!("STT stopped (no text)");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("STT stop failed: {}", e);
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("STT stop channel error: {}", e);
+            }
+            Err(_) => {
+                tracing::warn!("STT stop timeout (2s)");
+            }
+        }
     }
 }
 
@@ -344,79 +461,161 @@ impl TtsSttService {
     async fn status_changed(emitter: &zbus::object_server::SignalEmitter<'_>, status: &str) -> zbus::Result<()>;
 
     /// Text-to-Speech: Convert text to speech
-    /// 
+    ///
     /// Cancels any ongoing STT operation and stops any previous TTS operation
     /// before starting the new TTS request.
+    ///
+    /// Returns immediately after starting TTS (does not wait for completion).
+    /// Use the StatusChanged signal to track when speaking completes.
     async fn tts(&self, text: String, language: String) -> Result<(), FdoError> {
+        tracing::info!("Daemon: TTS request for language: {}, text: '{}'", language, text);
+
         // Cancel any ongoing STT operation and stop any previous TTS
+        tracing::debug!("Cancelling any ongoing operations...");
         self.cancel_stt().await;
         self.cancel_tts().await;
-        
-        // Now start the new TTS request
-        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        // Now start the new TTS request (return immediately, don't wait for completion)
+        tracing::debug!("Starting TTS generation...");
+        let (tx, _rx) = tokio::sync::oneshot::channel();
         self.tts_tx
             .send(TtsRequest::Speak { text, language, reply: tx })
             .map_err(|e| FdoError::Failed(format!("TTS channel closed: {}", e)))?;
-        
-        rx.await
-            .map_err(|e| FdoError::Failed(format!("TTS reply channel error: {}", e)))?
-            .map_err(|e| FdoError::Failed(format!("TTS failed: {}", e)))?;
 
+        tracing::info!("TTS started successfully (running in background)");
+        // Return immediately - TTS will continue in background
         Ok(())
     }
 
     /// Speech-to-Text: Convert speech to text
-    /// 
+    ///
     /// Stops any ongoing TTS operation and cancels any previous STT operation
     /// before starting the new STT request.
+    ///
+    /// Waits for STT to complete and returns the recognized text.
+    /// Use StatusChanged signal to track status changes (listening -> processing -> idle).
     async fn stt(&self, language: String, pause_duration: f64) -> Result<String, FdoError> {
+        tracing::info!("Daemon: STT request for language: {}, pause: {}s", language, pause_duration);
+
         // Stop any ongoing TTS operation and cancel any previous STT
+        tracing::debug!("Cancelling any ongoing operations...");
         self.cancel_tts().await;
         self.cancel_stt().await;
 
-        // Start listening
+        // Start listening and wait for completion
+        tracing::debug!("Starting STT listening...");
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.stt_tx
             .send(SttRequest::StartListening { language, pause_duration, reply: tx })
             .map_err(|e| FdoError::Failed(format!("STT channel closed: {}", e)))?;
-        
-        rx.await
+
+        // Wait for STT to complete and get the text
+        tracing::debug!("Waiting for STT completion...");
+        let text = rx.await
             .map_err(|e| FdoError::Failed(format!("STT reply channel error: {}", e)))?
-            .map_err(|e| FdoError::Failed(format!("STT failed: {}", e)))
+            .map_err(|e| FdoError::Failed(format!("STT failed: {}", e)))?;
+
+        tracing::info!("STT completed with text: '{}'", text);
+        Ok(text)
     }
 
-    /// Stop all operations
-    /// 
+    /// Stop all operations with immediate cancellation
+    ///
     /// Stops any ongoing TTS playback and any ongoing STT listening operation.
-    /// If STT is listening, it will be stopped and moved to processing/decoding state
-    /// (same as when pause is detected), then to idle after completion.
-    async fn stop(&self) -> Result<(), FdoError> {
-        // Stop TTS (ignore errors)
+    /// Uses immediate cancellation tokens for both services.
+    ///
+    /// Returns the recognized text if STT was active, otherwise returns empty string.
+    async fn stop(&self) -> Result<String, FdoError> {
+        tracing::info!("Daemon: Stop all operations requested");
+
+        // Stop TTS with immediate cancellation
+        tracing::debug!("Stopping TTS...");
         self.cancel_tts().await;
-        
-        // Stop STT (will move to processing/decoding, then idle)
-        // Note: We propagate STT stop errors to caller
+
+        // Stop STT with immediate cancellation and get recognized text
+        tracing::debug!("Stopping STT...");
         let (tx_stt, rx_stt) = tokio::sync::oneshot::channel();
         self.stt_tx
             .send(SttRequest::Stop(tx_stt))
             .map_err(|e| FdoError::Failed(format!("STT channel closed: {}", e)))?;
-        
-        rx_stt.await
-            .map_err(|e| FdoError::Failed(format!("STT reply channel error: {}", e)))?
-            .map_err(|e| FdoError::Failed(format!("Stop STT failed: {}", e)))?;
 
-        Ok(())
+        // Wait for stop to complete with timeout
+        let text = match tokio::time::timeout(std::time::Duration::from_secs(2), rx_stt).await {
+            Ok(Ok(result)) => {
+                match result {
+                    Ok(text) => {
+                        if !text.is_empty() {
+                            tracing::info!("STT stopped with text: '{}'", text);
+                        } else {
+                            tracing::info!("STT stopped (no text recognized)");
+                        }
+                        text
+                    }
+                    Err(e) => {
+                        tracing::warn!("STT stop failed: {}", e);
+                        String::new()
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("STT stop channel error: {}", e);
+                String::new()
+            }
+            Err(_) => {
+                tracing::warn!("STT stop timeout (2s)");
+                String::new()
+            }
+        };
+
+        // Emit "idle" status after stopping all operations
+        Self::emit_status(&self.status_tx, "idle");
+
+        tracing::info!("All operations stopped successfully");
+        Ok(text)
     }
 
 
     /// Speech-to-Text Type: Convert speech to text and type it character-by-character using wrtype
+    ///
+    /// Starts STT and waits for it to complete, then types the recognized text.
+    /// Note: This method waits for STT completion internally (unlike stt() which returns immediately).
+    /// It uses the original StartListening mechanism that waits for completion.
     async fn stt_type(&self, language: String, pause_duration: f64) -> Result<(), FdoError> {
-        // First, get the text using STT
-        let text = self.stt(language, pause_duration).await?;
+        tracing::info!("Daemon: STT Type request for language: {}, pause: {}s", language, pause_duration);
 
+        // Use StartListening directly and wait for completion (for stt_type we need the text)
+        // Stop any ongoing operations first
+        tracing::debug!("Cancelling any ongoing operations...");
+        self.cancel_tts().await;
+        self.cancel_stt().await;
+
+        // Start listening and wait for completion
+        tracing::debug!("Starting STT listening for typing...");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.stt_tx
+            .send(SttRequest::StartListening { language, pause_duration, reply: tx })
+            .map_err(|e| FdoError::Failed(format!("STT channel closed: {}", e)))?;
+
+        // Wait for STT to complete and get the text
+        tracing::debug!("Waiting for STT completion...");
+        let text = rx.await
+            .map_err(|e| FdoError::Failed(format!("STT reply channel error: {}", e)))?
+            .map_err(|e| FdoError::Failed(format!("STT failed: {}", e)))?;
+
+        tracing::info!("STT completed with text: '{}', now typing...", text);
+
+        // Type the text
+        self.type_text(text).await
+    }
+    
+    /// Helper: Type text using wrtype (internal)
+    async fn type_text(&self, text: String) -> Result<(), FdoError> {
         if text.is_empty() {
+            tracing::debug!("No text to type");
             return Ok(()); // Nothing to type
         }
+
+        tracing::debug!("Typing text: '{}'", text);
 
         // Clone the client Arc before moving into the closure
         let client_arc = Arc::clone(&self.client);
@@ -427,13 +626,14 @@ impl TtsSttService {
             let client = client_guard.as_mut().ok_or("Client not initialized")?;
             client.type_text_with_delay(&text, Duration::from_millis(10))
                 .map_err(|e| format!("Failed to type text: {}", e))?;
-            
+
             Ok(())
         })
         .await
         .map_err(|e| FdoError::Failed(format!("Task join error: {}", e)))?
         .map_err(|e| FdoError::Failed(e))?;
 
+        tracing::debug!("Text typed successfully");
         Ok(())
     }
 }
