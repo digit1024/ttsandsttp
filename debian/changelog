@@ -1,3 +1,11 @@
+ttsandsttp (1.2-1) unstable; urgency=medium
+
+  * Faster STT typing (removed per-character delay)
+  * More reliable recognizer reinitialization
+  * Better logging and latency fixes
+
+ -- digit1024 <digit1024@example.com>  Wed, 23 Sep 2026 19:47:36 +0200
+
 ttsandsttp (0.1.0-1) unstable; urgency=medium
 
   * Initial release
