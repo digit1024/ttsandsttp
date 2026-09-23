@@ -624,7 +624,7 @@ impl TtsSttService {
         tokio::task::spawn_blocking(move || -> Result<(), String> {
             let mut client_guard = client_arc.lock().unwrap();
             let client = client_guard.as_mut().ok_or("Client not initialized")?;
-            client.type_text_with_delay(&text, Duration::from_millis(10))
+            client.type_text_with_delay(&text, Duration::from_millis(0))
                 .map_err(|e| format!("Failed to type text: {}", e))?;
 
             Ok(())

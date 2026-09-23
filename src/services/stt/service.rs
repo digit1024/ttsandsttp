@@ -351,7 +351,11 @@ impl SttService {
         
         {
             let state = self.read_state();
-            let needs_reinit = !state.initialized || state.current_language != normalized_lang;
+            let recognizer_exists = {
+                let recognizer_guard = self.recognizer.lock().unwrap();
+                recognizer_guard.is_some()
+            };
+            let needs_reinit = !state.initialized || !recognizer_exists || state.current_language != normalized_lang;
             drop(state);
             
             if needs_reinit {
@@ -362,7 +366,7 @@ impl SttService {
                 }
                 
                 // Reinitialize with new language if needed
-                if !self.read_state().initialized {
+                if !self.read_state().initialized || !recognizer_exists {
                     self.init().await?;
                 } else {
                     // Language changed, need to reinitialize recognizer
@@ -970,12 +974,22 @@ impl SttService {
 
         // Drop the recognizer AFTER decode completes or timeout
         // This ensures sherpa-rs resources are cleaned up
-        {
+        let should_reset_initialized = {
             let mut recognizer_guard = self.recognizer.lock().unwrap();
             if let Some(recognizer) = recognizer_guard.take() {
                 drop(recognizer);
                 tracing::debug!("WhisperRecognizer dropped");
+                true
+            } else {
+                false
             }
+        };
+        
+        // Reset initialized flag since recognizer was dropped
+        // This ensures it will be reinitialized on next start_listening call
+        if should_reset_initialized {
+            let mut state = self.write_state();
+            state.initialized = false;
         }
 
         // Clear the task handle
