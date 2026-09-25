@@ -2,6 +2,22 @@
 # This file will be copied to ~/.config/ttsandsttp/config.toml on first run
 # Uncomment languages you want to enable
 
+# ---------------------------------------------------------------------------
+# Cloud API (Alibaba Cloud Model Studio / DashScope, "Qwen")
+# ---------------------------------------------------------------------------
+# Cloud usage is opt-in: set `provider = "dashscope"` on [stt] or [tts.<lang>].
+# The API key is never stored here. Store it securely with:
+#     ttsandsttp set-key          # freedesktop keyring
+# or via systemd LoadCredential, a 0600 file, or $DASHSCOPE_API_KEY (dev only).
+# Dictation audio is uploaded to Alibaba when the dashscope provider is used.
+[api]
+region = "singapore"   # singapore | beijing | custom
+# base_url = "https://dashscope-intl.aliyuncs.com/api/v1"  # required when region = custom
+# api_key_env = "DASHSCOPE_API_KEY"                        # override env var name
+# key_source = "auto"   # auto | credential | keyring | file | env
+# key_file = "~/.config/ttsandsttp/dashscope.singapore.key"
+# timeout_secs = 60
+
 [tts]
 # Default TTS language (used when language is not specified)
 default = "en"
@@ -9,7 +25,14 @@ default = "en"
 # English (US) - Default enabled
 [tts.en]
 enabled = true
-# Available models:
+# Backend: "local" (sherpa, offline) or "dashscope" (Qwen cloud)
+provider = "local"
+# Cloud settings (used only when provider = "dashscope"):
+#   api_model = "qwen3-tts-flash"
+#   voice = "Cherry"          # see `ttsandsttp voices`
+#   language_type = "English" # derived from the language code if omitted
+#   stream = true             # SSE streaming PCM playback
+# Available local models:
 #   - "vits-piper-en_US-amy-low" (voice: amy, quality: low, 64MB) - DEFAULT
 #   - "vits-piper-en_US-libritts_r-medium" (voice: libritts_r, quality: medium, 128MB)
 #   - "vits-piper-en_US-glados" (voice: glados, quality: medium, 128MB)
@@ -89,7 +112,14 @@ model_id = "vits-piper-en_US-amy-low"
 # model_id = "vits-piper-pl_PL-zenski_wg_glos-medium"
 
 [stt]
-# Whisper model to use for Speech-to-Text
+# Backend: "local" (offline Whisper) or "dashscope" (Qwen cloud ASR)
+provider = "local"
+
+# Cloud settings (used only when provider = "dashscope"):
+#   api_model = "qwen3-asr-flash"
+#   api_language = ""   # optional fixed language hint (e.g. "en", "zh")
+
+# Whisper model to use for Speech-to-Text (local provider)
 # Options: 
 #   - "sherpa-onnx-whisper-tiny" (recommended, multilingual, 75MB)
 #   - "sherpa-onnx-whisper-tiny.en" (English only, 75MB)

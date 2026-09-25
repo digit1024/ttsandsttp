@@ -1,3 +1,17 @@
+ttsandsttp (1.3-1) unstable; urgency=medium
+
+  * Cloud providers (Alibaba Cloud Model Studio / DashScope "Qwen")
+    - Opt-in cloud Speech-to-Text (qwen3-asr-flash) via [stt] provider
+    - Opt-in cloud Text-to-Speech (qwen3-tts-flash) with voice selection
+    - New [api] section: region presets (singapore/beijing/custom),
+      configurable base URL and key handling
+  * Secure API key storage: systemd credentials, freedesktop Secret
+    Service keyring, 0600 file, or env; keys are never stored in config
+  * New CLI: set-key, del-key, voices, bench-stt (local vs cloud A/B)
+  * Bundled Qwen-TTS voice catalogue and `voices` command
+  * Local (sherpa) remains the default and works fully offline
+
+ -- digit1024 <digit1024@example.com>  Fri, 25 Sep 2026 21:37:10 +0200
 ttsandsttp (1.2-1) unstable; urgency=medium
 
   * Faster STT typing (removed per-character delay)

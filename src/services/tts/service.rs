@@ -8,10 +8,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use rayon::prelude::*;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OnceCell};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::SharedConfig;
+use crate::config::{language_type_for_code, SharedConfig, TtsLanguageConfig};
+use crate::services::api::{DashScopeClient, DASHSCOPE_TTS_SAMPLE_RATE};
 use crate::services::ModelManager;
 use crate::utils::{DirectSampleSource, normalize_language_code, split_into_sentences};
 
@@ -30,7 +31,7 @@ use crate::utils::{DirectSampleSource, normalize_language_code, split_into_sente
 /// # async fn example() -> anyhow::Result<()> {
 /// let tts = TtsService::new()?;
 /// tts.init().await?;
-/// tts.set_language("en-US")?;
+/// tts.set_language("en-US").await?;
 /// tts.speak("Hello, world!").await?;
 /// # Ok(())
 /// # }
@@ -45,6 +46,7 @@ pub struct TtsService {
     shared_config: Arc<SharedConfig>, // Shared config and registry
     cancellation_token: Arc<Mutex<Option<CancellationToken>>>, // For immediate cancellation
     generation_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>, // Background generation task
+    api_client: Arc<OnceCell<Arc<DashScopeClient>>>, // Lazily resolved DashScope client
 }
 
 #[derive(Clone, Debug)]
@@ -96,9 +98,34 @@ impl TtsService {
             shared_config: Arc::new(shared_config.clone()),
             cancellation_token: Arc::new(Mutex::new(None)),
             generation_task: Arc::new(Mutex::new(None)),
+            api_client: Arc::new(OnceCell::new()),
         })
     }
     
+    /// Resolve (once) the DashScope client, failing loudly if no key is available.
+    async fn ensure_api_client(&self) -> Result<Arc<DashScopeClient>> {
+        let client = self
+            .api_client
+            .get_or_try_init(|| async {
+                DashScopeClient::new(&self.shared_config.config().api)
+                    .await
+                    .map(Arc::new)
+            })
+            .await?;
+        Ok(Arc::clone(client))
+    }
+
+    /// Return this language's config if it uses the DashScope provider.
+    fn cloud_language_config(&self) -> Option<TtsLanguageConfig> {
+        let current = normalize_language_code(&self.current_language());
+        self.shared_config
+            .config()
+            .tts
+            .languages
+            .get(&current)
+            .filter(|cfg| cfg.provider.is_dashscope())
+            .cloned()
+    }
     
     /// Get model files for a language code
     fn get_model_files_for_language(&self, lang_code: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
@@ -135,7 +162,21 @@ impl TtsService {
     /// Initialize the TTS engine for a specific language
     pub async fn init_with_language(&self, lang_code: &str) -> Result<()> {
         let normalized_lang = normalize_language_code(lang_code);
-        
+
+        // Cloud provider: no local engine to load.
+        {
+            let config = self.shared_config.config();
+            if let Some(lang_cfg) = config.tts.languages.get(&normalized_lang) {
+                if lang_cfg.provider.is_dashscope() {
+                    let mut state = self.write_state();
+                    state.initialized = true;
+                    state.current_language = normalized_lang;
+                    tracing::info!("DashScope TTS provider selected for '{}'", lang_code);
+                    return Ok(());
+                }
+            }
+        }
+
         // Check if already initialized for this language
         {
             let state = self.read_state();
@@ -242,6 +283,11 @@ impl TtsService {
             self.init_with_language(&current_lang).await?;
         }
 
+        // Cloud provider path (Qwen TTS)
+        if let Some(lang_cfg) = self.cloud_language_config() {
+            return self.speak_cloud(text, &lang_cfg).await;
+        }
+
         // Pre-create audio stream before generation (optimization #2)
         self.ensure_audio_stream()?;
 
@@ -280,6 +326,117 @@ impl TtsService {
         }
 
         result
+    }
+
+    /// Cloud TTS path: stream PCM per sentence and play it.
+    async fn speak_cloud(&self, text: &str, lang_config: &TtsLanguageConfig) -> Result<()> {
+        let client = self.ensure_api_client().await?;
+        self.ensure_audio_stream()?;
+
+        {
+            let mut state = self.write_state();
+            state.playing = true;
+        }
+
+        let result = self.speak_cloud_inner(&client, text, lang_config).await;
+
+        {
+            let mut state = self.write_state();
+            state.playing = false;
+        }
+        {
+            let mut token_guard = self.cancellation_token.lock().unwrap();
+            token_guard.take();
+        }
+        result
+    }
+
+    async fn speak_cloud_inner(
+        &self,
+        client: &DashScopeClient,
+        text: &str,
+        lang_config: &TtsLanguageConfig,
+    ) -> Result<()> {
+        let cancellation_token = CancellationToken::new();
+        {
+            let mut token_guard = self.cancellation_token.lock().unwrap();
+            *token_guard = Some(cancellation_token.clone());
+        }
+
+        let sink = {
+            let sink_guard = self.sink.lock().unwrap();
+            sink_guard.clone().ok_or_else(|| anyhow::anyhow!("Audio sink not available"))?
+        };
+
+        let voice = if lang_config.voice.trim().is_empty() {
+            "Cherry".to_string()
+        } else {
+            lang_config.voice.clone()
+        };
+        let language_type = if lang_config.language_type.trim().is_empty() {
+            language_type_for_code(&normalize_language_code(&self.current_language())).to_string()
+        } else {
+            lang_config.language_type.clone()
+        };
+
+        let sentences = split_into_sentences(text);
+        if sentences.is_empty() {
+            return Ok(());
+        }
+
+        for sentence in sentences {
+            if cancellation_token.is_cancelled() {
+                break;
+            }
+
+            let sink_clone = sink.clone();
+            let token_clone = cancellation_token.clone();
+            let on_chunk = move |samples: Vec<i16>| {
+                if token_clone.is_cancelled() {
+                    return;
+                }
+                sink_clone.append(DirectSampleSource::new(samples, DASHSCOPE_TTS_SAMPLE_RATE));
+            };
+
+            client
+                .synthesize_pcm_stream(
+                    &lang_config.api_model,
+                    &sentence,
+                    &voice,
+                    &language_type,
+                    &cancellation_token,
+                    on_chunk,
+                )
+                .await?;
+        }
+
+        self.wait_for_sink_drain(&sink, &cancellation_token).await;
+        Ok(())
+    }
+
+    /// Wait until the sink finishes playing, honouring cancellation.
+    async fn wait_for_sink_drain(&self, sink: &Arc<rodio::Sink>, token: &CancellationToken) {
+        loop {
+            if token.is_cancelled() {
+                sink.stop();
+                return;
+            }
+            if sink.empty() {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                        if sink.empty() {
+                            return;
+                        }
+                    }
+                    _ = token.cancelled() => {
+                        sink.stop();
+                        return;
+                    }
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
     }
 
     /// Simple speak path for short text (no chunking overhead) with cancellation support

@@ -178,35 +178,52 @@ impl ConfigValidator {
 
         // Validate enabled TTS languages
         for (lang_code, lang_config) in &config.tts.languages {
-            if lang_config.enabled {
-                // Check if language code is valid
-                if !registry.tts_models.contains_key(lang_code) {
-                    let supported: Vec<&str> = registry.tts_models.keys().map(|s| s.as_str()).collect();
-                    anyhow::bail!(
-                        "Invalid TTS language code: '{}'. Supported languages: {}",
-                        lang_code,
-                        supported.join(", ")
-                    );
-                }
+            if !lang_config.enabled {
+                continue;
+            }
 
-                // Check if model ID is valid for this language
-                if registry.get_tts_model(lang_code, &lang_config.model_id).is_none() {
-                    let available_models: Vec<String> = registry
-                        .get_tts_models_for_language(lang_code)
-                        .map(|models| models.iter().map(|m| m.id.clone()).collect())
-                        .unwrap_or_default();
+            // Cloud providers do not use the local model registry.
+            if lang_config.provider.is_dashscope() {
+                if lang_config.api_model.trim().is_empty() {
                     anyhow::bail!(
-                        "Invalid TTS model ID '{}' for language '{}'. Available models: {}",
-                        lang_config.model_id,
-                        lang_code,
-                        available_models.join(", ")
+                        "TTS language '{}' uses the dashscope provider but has an empty api_model",
+                        lang_code
                     );
                 }
+                continue;
+            }
+
+            // Check if language code is valid
+            if !registry.tts_models.contains_key(lang_code) {
+                let supported: Vec<&str> = registry.tts_models.keys().map(|s| s.as_str()).collect();
+                anyhow::bail!(
+                    "Invalid TTS language code: '{}'. Supported languages: {}",
+                    lang_code,
+                    supported.join(", ")
+                );
+            }
+
+            // Check if model ID is valid for this language
+            if registry.get_tts_model(lang_code, &lang_config.model_id).is_none() {
+                let available_models: Vec<String> = registry
+                    .get_tts_models_for_language(lang_code)
+                    .map(|models| models.iter().map(|m| m.id.clone()).collect())
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "Invalid TTS model ID '{}' for language '{}'. Available models: {}",
+                    lang_config.model_id,
+                    lang_code,
+                    available_models.join(", ")
+                );
             }
         }
 
         // Validate STT model
-        if !registry.is_valid_stt_model_id(&config.stt.model_id) {
+        if config.stt.provider.is_dashscope() {
+            if config.stt.api_model.trim().is_empty() {
+                anyhow::bail!("STT uses the dashscope provider but has an empty api_model");
+            }
+        } else if !registry.is_valid_stt_model_id(&config.stt.model_id) {
             let supported: Vec<&str> = registry.stt_models.keys().map(|s| s.as_str()).collect();
             anyhow::bail!(
                 "Invalid STT model ID: '{}'. Supported models: {}",
@@ -224,3 +241,75 @@ impl ConfigValidator {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::models::{ApiConfig, ApiRegion, AppConfig};
+
+    #[test]
+    fn default_template_parses() {
+        let cfg: AppConfig =
+            toml::from_str(include_str!("../../config.toml.default")).expect("template parses");
+        assert_eq!(cfg.tts.default, "en");
+        assert!(!cfg.tts.languages["en"].provider.is_dashscope());
+        assert!(!cfg.stt.provider.is_dashscope());
+    }
+
+    #[test]
+    fn legacy_config_defaults_to_local() {
+        let toml = r#"
+[tts]
+default = "en"
+[tts.en]
+enabled = true
+model_id = "vits-piper-en_US-amy-low"
+[stt]
+model_id = "sherpa-onnx-whisper-tiny"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("legacy config parses");
+        assert!(!cfg.tts.languages["en"].provider.is_dashscope());
+        assert_eq!(cfg.tts.languages["en"].api_model, "qwen3-tts-flash");
+        assert_eq!(cfg.api.region, ApiRegion::Singapore);
+    }
+
+    #[test]
+    fn dashscope_provider_skips_registry_validation() {
+        let toml = r#"
+[api]
+region = "singapore"
+[tts]
+default = "en"
+[tts.en]
+enabled = true
+provider = "dashscope"
+api_model = "qwen3-tts-flash"
+voice = "Cherry"
+[stt]
+provider = "dashscope"
+api_model = "qwen3-asr-flash"
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("cloud config parses");
+        ConfigValidator::validate(&cfg).expect("cloud config validates without registry entries");
+    }
+
+    #[test]
+    fn api_region_presets() {
+        let mut api = ApiConfig::default();
+        assert_eq!(
+            api.effective_base_url(),
+            "https://dashscope-intl.aliyuncs.com/api/v1"
+        );
+        api.region = ApiRegion::Beijing;
+        assert_eq!(
+            api.effective_base_url(),
+            "https://dashscope.aliyuncs.com/api/v1"
+        );
+        api.region = ApiRegion::Custom;
+        api.base_url = "https://ws.ap-southeast-1.maas.aliyuncs.com/api/v1".into();
+        assert_eq!(
+            api.effective_base_url(),
+            "https://ws.ap-southeast-1.maas.aliyuncs.com/api/v1"
+        );
+    }
+}

@@ -57,8 +57,66 @@ The `scripts/` folder contains ready-to-use wrappers:
 
 ## Configuration
 
+Configuration lives at `~/.config/ttsandsttp/config.toml` (created from
+`config.toml.default` on first run).
 
+### Cloud providers (Qwen / Alibaba Cloud Model Studio)
 
+Cloud STT/TTS is **opt-in** and **local remains the default**. To use it, set
+`provider = "dashscope"` on `[stt]` or `[tts.<lang>]`:
+
+```toml
+[api]
+region = "singapore"        # singapore | beijing | custom
+
+[stt]
+provider  = "dashscope"
+api_model = "qwen3-asr-flash"
+
+[tts.en]
+provider  = "dashscope"
+api_model = "qwen3-tts-flash"
+voice     = "Cherry"
+```
+
+When the DashScope provider is active, dictated audio is uploaded to Alibaba
+Cloud. The local provider never leaves your machine.
+
+### API key storage
+
+The key is never written to `config.toml`. Resolution order
+(`key_source = "auto"`) is:
+
+1. systemd `$CREDENTIALS_DIRECTORY` (`LoadCredential=dashscope-<region>:<path>`)
+2. freedesktop Secret Service keyring (GNOME Keyring / KWallet)
+3. a `0600` file at `~/.config/ttsandsttp/dashscope.<region>.key`
+4. `$DASHSCOPE_API_KEY` (development only)
+
+Store it in the keyring:
+
+```bash
+ttsandsttp set-key     # prompts; writes to the Secret Service keyring
+ttsandsttp del-key     # removes it
+```
+
+### Voice selection
+
+```bash
+ttsandsttp voices              # list bundled Qwen-TTS voices
+ttsandsttp voices --lang en
+```
+
+Set the chosen voice with `[tts.<lang>] voice = "Cherry"`. Any voice string is
+accepted (unknown names are passed through with a warning).
+
+### Comparing quality
+
+```bash
+ttsandsttp bench-stt recording.wav --lang en
+```
+
+Runs the same audio through the configured backend and the local Whisper model,
+printing the transcript and latency for each.
 ## Requirements
 
 - Linux with PulseAudio or ALSA

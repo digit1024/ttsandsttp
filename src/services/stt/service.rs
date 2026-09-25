@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
 use super::audio_processor::AudioProcessor;
@@ -15,8 +16,9 @@ use super::audio_utils::{
 };
 use super::pause_detector::PauseDetector;
 use crate::config::SharedConfig;
+use crate::services::api::DashScopeClient;
 use crate::services::ModelManager;
-use crate::utils::{normalize_language_code, play_beep, play_beep_blocking, BEEP_HIGH_WAV, BEEP_LOW_WAV};
+use crate::utils::{create_wav_buffer, normalize_language_code, play_beep, play_beep_blocking, BEEP_HIGH_WAV, BEEP_LOW_WAV};
 use tracing;
 
 // Audio processing constants
@@ -65,10 +67,18 @@ pub struct SttService {
     error_callback: Arc<Mutex<Option<Box<dyn Fn(String) + Send + Sync>>>>,
     audio_thread_handle: Arc<Mutex<Option<(std::thread::Thread, std::sync::mpsc::Sender<()>)>>>,
     audio_task_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    decode_complete_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
-    decode_complete_rx: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<String>>>>,
+    decode_complete_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<String, String>>>>>,
+    decode_complete_rx: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<Result<String, String>>>>>,
     shared_config: Arc<SharedConfig>, // Shared config and registry
     cancellation_token: Arc<Mutex<Option<CancellationToken>>>, // For immediate cancellation
+    api_client: Arc<OnceCell<Arc<DashScopeClient>>>, // Lazily resolved DashScope client
+}
+
+/// Cloud ASR context passed into the audio capture task
+struct CloudAsr {
+    client: Arc<DashScopeClient>,
+    model: String,
+    language: String,
 }
 
 /// Internal state of the STT service
@@ -158,7 +168,21 @@ impl SttService {
             decode_complete_rx: Arc::new(Mutex::new(None)),
             shared_config: Arc::new(shared_config.clone()),
             cancellation_token: Arc::new(Mutex::new(None)),
+            api_client: Arc::new(OnceCell::new()),
         })
+    }
+    
+    /// Resolve (once) the DashScope client, failing loudly if no key is available.
+    async fn ensure_api_client(&self) -> Result<Arc<DashScopeClient>> {
+        let client = self
+            .api_client
+            .get_or_try_init(|| async {
+                DashScopeClient::new(&self.shared_config.config().api)
+                    .await
+                    .map(Arc::new)
+            })
+            .await?;
+        Ok(Arc::clone(client))
     }
     
     
@@ -202,6 +226,15 @@ impl SttService {
             if state.initialized {
                 return Ok(());
             }
+        }
+
+        // Cloud provider: no local model to load. The API key is resolved lazily
+        // on first use so a locked keyring cannot block daemon startup.
+        if self.shared_config.config().stt.provider.is_dashscope() {
+            let mut state = self.write_state();
+            state.initialized = true;
+            tracing::info!("DashScope STT provider selected (key resolved on first use)");
+            return Ok(());
         }
 
         // Set environment variable early to enable debug mode (prevents C++ exceptions)
@@ -277,6 +310,13 @@ impl SttService {
     pub async fn init_with_language(&self, lang_code: &str) -> Result<()> {
         let normalized_lang = normalize_language_code(lang_code);
         
+        if self.shared_config.config().stt.provider.is_dashscope() {
+            let mut state = self.write_state();
+            state.initialized = true;
+            state.current_language = normalized_lang;
+            return Ok(());
+        }
+
         // Get Whisper model files from config
         let (encoder_file, decoder_file, tokens_file, model_language) = self.get_whisper_model_files()?;
 
@@ -348,32 +388,46 @@ impl SttService {
     /// Start listening for speech (async)
     pub async fn start_listening(&self, lang: &str, pause_duration: Duration) -> Result<()> {
         let normalized_lang = normalize_language_code(lang);
-        
-        {
-            let state = self.read_state();
+        let stt_config = self.shared_config.config().stt.clone();
+
+        // For the cloud provider, resolve the API client up front so we fail
+        // loudly (before recording) if no key is available.
+        let cloud_asr = if stt_config.provider.is_dashscope() {
+            let client = self.ensure_api_client().await?;
+            let language = if stt_config.api_language.trim().is_empty() {
+                normalized_lang.clone()
+            } else {
+                stt_config.api_language.clone()
+            };
+            Some(Arc::new(CloudAsr {
+                client,
+                model: stt_config.api_model.clone(),
+                language,
+            }))
+        } else {
+            // Local provider: ensure the Whisper recognizer matches the language.
             let recognizer_exists = {
                 let recognizer_guard = self.recognizer.lock().unwrap();
                 recognizer_guard.is_some()
             };
-            let needs_reinit = !state.initialized || !recognizer_exists || state.current_language != normalized_lang;
-            drop(state);
-            
+            let (initialized, current_language) = {
+                let state = self.read_state();
+                (state.initialized, state.current_language.clone())
+            };
+            let needs_reinit = !initialized || !recognizer_exists || current_language != normalized_lang;
             if needs_reinit {
-                // Update language in state first
                 {
                     let mut state = self.write_state();
                     state.current_language = normalized_lang.clone();
                 }
-                
-                // Reinitialize with new language if needed
-                if !self.read_state().initialized || !recognizer_exists {
+                if !initialized || !recognizer_exists {
                     self.init().await?;
                 } else {
-                    // Language changed, need to reinitialize recognizer
                     self.init_with_language(&normalized_lang).await?;
                 }
             }
-        }
+            None
+        };
 
         {
             let mut state = self.write_state();
@@ -409,6 +463,7 @@ impl SttService {
         let pause_duration = pause_duration;
         let recording_started_clone = recording_started.clone();
         let cancellation_token_clone = cancellation_token.clone();
+        let cloud_asr_for_task = cloud_asr.clone();
 
         // Create channel for decode completion signal
         let (decode_tx, decode_rx) = tokio::sync::oneshot::channel();
@@ -425,6 +480,7 @@ impl SttService {
         let handle = tokio::spawn(async move {
             if let Err(e) = Self::audio_capture_loop(
                 recognizer,
+                cloud_asr_for_task,
                 result_callback,
                 pause_callback,
                 error_callback.clone(),
@@ -471,6 +527,7 @@ impl SttService {
     /// Audio capture loop - handles audio input and recognition with cancellation support
     async fn audio_capture_loop(
         recognizer: Arc<Mutex<Option<sherpa_rs::whisper::WhisperRecognizer>>>,
+        cloud_asr: Option<Arc<CloudAsr>>,
         result_callback: Arc<Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>>>,
         pause_callback: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>,
         error_callback: Arc<Mutex<Option<Box<dyn Fn(String) + Send + Sync>>>>,
@@ -478,7 +535,7 @@ impl SttService {
         audio_thread_handle: Arc<Mutex<Option<(std::thread::Thread, std::sync::mpsc::Sender<()>)>>>,
         pause_duration: Duration,
         recording_started: Arc<Mutex<bool>>,
-        decode_complete_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+        decode_complete_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<String, String>>>>>,
         cancellation_token: CancellationToken,
     ) -> Result<()> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -577,6 +634,7 @@ impl SttService {
                 // Decode any accumulated audio before stopping
                 Self::decode_accumulated_audio(
                     &recognizer,
+                    &cloud_asr,
                     &result_callback,
                     &state,
                     &mut accumulated_audio,
@@ -673,6 +731,7 @@ impl SttService {
                                         tracing::debug!("Decoding {} samples...", accumulated_audio.len());
                                         Self::decode_accumulated_audio(
                                             &recognizer,
+                                            &cloud_asr,
                                             &result_callback,
                                             &state,
                                             &mut accumulated_audio,
@@ -770,13 +829,14 @@ impl SttService {
         }
     }
 
-    /// Decode accumulated audio using Whisper
+    /// Decode accumulated audio using the configured backend
     async fn decode_accumulated_audio(
         recognizer: &Arc<Mutex<Option<sherpa_rs::whisper::WhisperRecognizer>>>,
+        cloud_asr: &Option<Arc<CloudAsr>>,
         result_callback: &Arc<Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>>>,
         state: &Arc<RwLock<SttState>>,
         accumulated_audio: &mut Vec<f32>,
-        decode_complete_tx: &Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+        decode_complete_tx: &Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<String, String>>>>>,
     ) {
         if accumulated_audio.len() < MIN_AUDIO_DURATION {
             tracing::warn!(
@@ -822,13 +882,29 @@ impl SttService {
             return;
         }
 
-        // Transcribe using Whisper
+        // Transcribe using the configured backend
         let decode_start = Instant::now();
-        let text = {
+        let text: String = if let Some(cloud) = cloud_asr {
+            match Self::transcribe_cloud(cloud, &audio_to_decode).await {
+                Ok(text) => text,
+                Err(e) => {
+                    tracing::error!("DashScope ASR failed: {:#}", e);
+                    {
+                        let mut state_guard = state.write().unwrap();
+                        state_guard.current_text = String::new();
+                    }
+                    // Fail loudly: propagate the error to the DBus caller.
+                    let mut tx_guard = decode_complete_tx.lock().unwrap();
+                    if let Some(tx) = tx_guard.take() {
+                        let _ = tx.send(Err(e.to_string()));
+                    }
+                    return;
+                }
+            }
+        } else {
             let mut rec_guard = recognizer.lock().unwrap();
             if let Some(ref mut rec) = *rec_guard {
-                let result = rec.transcribe(TARGET_SAMPLE_RATE, &audio_to_decode);
-                result.text
+                rec.transcribe(TARGET_SAMPLE_RATE, &audio_to_decode).text
             } else {
                 String::new()
             }
@@ -861,9 +937,24 @@ impl SttService {
         {
             let mut tx_guard = decode_complete_tx.lock().unwrap();
             if let Some(tx) = tx_guard.take() {
-                let _ = tx.send(text);
+                let _ = tx.send(Ok(text));
             }
         }
+    }
+
+    /// Transcribe audio using DashScope (f32 PCM -> 16-bit WAV -> base64).
+    async fn transcribe_cloud(cloud: &CloudAsr, samples: &[f32]) -> Result<String> {
+        let pcm_i16: Vec<i16> = samples
+            .iter()
+            .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+            .collect();
+        let wav = create_wav_buffer(&pcm_i16, TARGET_SAMPLE_RATE)?;
+        let language = if cloud.language.trim().is_empty() {
+            None
+        } else {
+            Some(cloud.language.as_str())
+        };
+        cloud.client.transcribe(&cloud.model, &wav, language).await
     }
 
     /// Stop listening and return the recognized text with immediate cancellation
@@ -954,9 +1045,13 @@ impl SttService {
                         tokio::time::timeout(timeout, rx).await
                     })
                 }).join() {
-                    Ok(Ok(Ok(text))) => {
+                    Ok(Ok(Ok(Ok(text)))) => {
                         tracing::debug!("Received decode result via channel");
                         text
+                    }
+                    Ok(Ok(Ok(Err(e)))) => {
+                        // Cloud transcription failed - propagate to the caller.
+                        return Err(anyhow::anyhow!(e));
                     }
                     Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
                         // Channel was closed, timeout, or thread panic - get text from state

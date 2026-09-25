@@ -11,6 +11,12 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
+# Optional: pass the DashScope API key as a systemd credential instead of the
+# keyring. The value is exposed to the service via $CREDENTIALS_DIRECTORY and is
+# never placed in the process environment. Name it dashscope-<region> (or just
+# dashscope). Keep the source file at mode 0600.
+# LoadCredential=dashscope-singapore:%h/.config/ttsandsttp/dashscope.singapore.key
+
 [Install]
 WantedBy=default.target
 

@@ -22,7 +22,7 @@ impl ConfigModelDownloader {
 
         // Download enabled TTS models
         for (lang_code, lang_config) in &config.tts.languages {
-            if lang_config.enabled {
+            if lang_config.enabled && !lang_config.provider.is_dashscope() {
                 if let Some(model_info) = registry.get_tts_model(lang_code, &lang_config.model_id) {
                     tracing::info!("Downloading TTS model for {}: {}", lang_code, model_info.id);
                     
@@ -61,7 +61,9 @@ impl ConfigModelDownloader {
         }
 
         // Download STT model
-        if let Some(model_info) = registry.get_stt_model(&config.stt.model_id) {
+        if config.stt.provider.is_dashscope() {
+            tracing::info!("STT provider is dashscope; skipping local Whisper model download");
+        } else if let Some(model_info) = registry.get_stt_model(&config.stt.model_id) {
             tracing::info!("Downloading STT model: {}", model_info.id);
             
             let models_dir = model_manager.models_dir();
