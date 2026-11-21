@@ -1,16 +1,29 @@
 # TTSandSTTP Configuration File
 # This file will be copied to ~/.config/ttsandsttp/config.toml on first run
 # Uncomment languages you want to enable
+#
+# Providers: "local" (offline, default) or any cloud provider below.
+# List everything with:
+#     ttsandsttp providers
+#     ttsandsttp models --cap stt        # or --cap tts
+#     ttsandsttp voices --provider openrouter --model elevenlabs/eleven-v4-turbo
 
 # ---------------------------------------------------------------------------
-# Cloud API (Alibaba Cloud Model Studio / DashScope, "Qwen")
+# Cloud providers
 # ---------------------------------------------------------------------------
-# Cloud usage is opt-in: set `provider = "dashscope"` on [stt] or [tts.<lang>].
-# The API key is never stored here. Store it securely with:
-#     ttsandsttp set-key          # freedesktop keyring
-# or via systemd LoadCredential, a 0600 file, or $DASHSCOPE_API_KEY (dev only).
-# Dictation audio is uploaded to Alibaba when the dashscope provider is used.
-[api]
+# Cloud usage is opt-in: set `provider = "<id>"` on [stt] or [tts.<lang>].
+# Catalog presets (groq, openrouter, dashscope) work without a section here;
+# add one to override endpoints, keys or timeouts. Custom providers require
+# a section with `kind` plus `base_url` (or explicit endpoints).
+#
+# API keys are NEVER stored here. Store them securely with:
+#     ttsandsttp set-key <provider>     # freedesktop keyring
+# or via systemd LoadCredential, a 0600 file, or the provider's env var
+# (GROQ_API_KEY, OPENROUTER_API_KEY, DASHSCOPE_API_KEY, ...).
+# Audio/text is sent only to the provider you configure.
+
+# Alibaba Cloud Model Studio / Qwen (STT: qwen3-asr-flash, TTS: qwen3-tts-flash)
+[providers.dashscope]
 region = "singapore"   # singapore | beijing | custom
 # base_url = "https://dashscope-intl.aliyuncs.com/api/v1"  # required when region = custom
 # api_key_env = "DASHSCOPE_API_KEY"                        # override env var name
@@ -18,27 +31,118 @@ region = "singapore"   # singapore | beijing | custom
 # key_file = "~/.config/ttsandsttp/dashscope.singapore.key"
 # timeout_secs = 60
 
+# Groq (STT: whisper-large-v3[-turbo], TTS: canopylabs/orpheus-*)
+# [providers.groq]
+# base_url = "https://api.groq.com/openai/v1"
+
+# OpenRouter (STT: scribe-v2, voxtral, whisper, nova-3; TTS: elevenlabs,
+# gemini, deepgram, minimax, kokoro, ... — see `ttsandsttp models --cap tts`)
+# [providers.openrouter]
+# base_url = "https://openrouter.ai/api/v1"
+
+# Any OpenAI-compatible server (vLLM, llama.cpp, LM Studio, OpenAI itself):
+# [providers.vllm-lan]
+# kind = "openai"                                        # openai | dashscope
+# base_url = "http://192.168.1.20:8000/v1"
+# requires_api_key = false                               # key-less LAN server
+# stt_endpoint = ""                                      # full endpoint overrides
+# tts_endpoint = ""
+
+# ---------------------------------------------------------------------------
+# Speech-to-Text
+# ---------------------------------------------------------------------------
+# Language is OPTIONAL: cloud models auto-detect the spoken language, and the
+# DBus caller can pass a language per request. The global [stt] section applies
+# to every language; add [stt.<lang>] sections to override per language.
+[stt]
+# "local" (offline Whisper) or a cloud provider id (groq, dashscope,
+# openrouter, custom_openai, custom_dashscope, or your own [providers.<id>])
+provider = "local"
+
+# Local Whisper model (provider = "local"):
+#   - "sherpa-onnx-whisper-tiny" (recommended, multilingual, 75MB)
+#   - "sherpa-onnx-whisper-tiny.en" (English only, 75MB)
+#   - "sherpa-onnx-whisper-base" (multilingual, 150MB)
+#   - "sherpa-onnx-whisper-base.en" (English only, 150MB)
+#   - "sherpa-onnx-whisper-small" (multilingual, 500MB)
+#   - "sherpa-onnx-whisper-medium" (multilingual, 1.5GB)
+#   - "sherpa-onnx-whisper-large-v3" (multilingual, 3GB)
+model_id = "sherpa-onnx-whisper-tiny"
+
+# Cloud settings (used only when provider != "local"):
+#   model = "whisper-large-v3-turbo"
+#     groq:       whisper-large-v3, whisper-large-v3-turbo        (max 300s)
+#     dashscope:  qwen3-asr-flash                                 (max 300s)
+#     openrouter: elevenlabs/scribe-v2,                           (max 45s)
+#                 mistralai/voxtral-small-transcribe-3-0,
+#                 openai/whisper-large-v3,
+#                 deepgram/nova-3 (requires an explicit language)
+#   language = ""            # fixed language hint; "" = auto-detect per call
+#   hints = ["Filip", "Karkina"]   # vocabulary hints (groq/dashscope/custom)
+#   extra_params = { }       # extra request fields passed through verbatim
+
+# Per-language overrides (optional). Empty fields inherit from [stt].
+# Example: cloud for everything, but a local model for Polish:
+# [stt.pl]
+# provider = "local"
+# model_id = "sherpa-onnx-whisper-small"
+#
+# Example: a different cloud model for German:
+# [stt.de]
+# model = "whisper-large-v3"
+
+# ---------------------------------------------------------------------------
+# Text-to-Speech
+# ---------------------------------------------------------------------------
 [tts]
-# Default TTS language (used when language is not specified)
+# Language used when the caller does not specify one
 default = "en"
+
+# Optional GLOBAL FALLBACK for any language without its own [tts.<lang>]
+# section. Cloud models are multilingual and detect the language from the
+# text, so one fallback covers every language. Must be a cloud provider —
+# local models are language-specific and need [tts.<lang>] sections.
+# Example (speaks any language via OpenRouter):
+#   provider = "openrouter"
+#   model    = "elevenlabs/eleven-v4-turbo"
+#   voice    = "sarah"
+# Other fallback keys: instructions, language_type, stream, extra_params.
+
+# Per-language sections take precedence over the global fallback (the whole
+# section is used as-is — no field merging). Uncomment languages to enable.
 
 # English (US) - Default enabled
 [tts.en]
 enabled = true
-# Backend: "local" (sherpa, offline) or "dashscope" (Qwen cloud)
+# "local" (sherpa/piper, offline) or a cloud provider id (dashscope, groq,
+# openrouter, custom_openai, custom_dashscope, or your own [providers.<id>])
 provider = "local"
-# Cloud settings (used only when provider = "dashscope"):
-#   api_model = "qwen3-tts-flash"
-#   voice = "Cherry"          # see `ttsandsttp voices`
-#   language_type = "English" # derived from the language code if omitted
-#   stream = true             # SSE streaming PCM playback
-# Available local models:
+
+# Local models (provider = "local"):
 #   - "vits-piper-en_US-amy-low" (voice: amy, quality: low, 64MB) - DEFAULT
 #   - "vits-piper-en_US-libritts_r-medium" (voice: libritts_r, quality: medium, 128MB)
 #   - "vits-piper-en_US-glados" (voice: glados, quality: medium, 128MB)
 #   - "vits-piper-en_US-lessac-medium" (voice: lessac, quality: medium, 128MB)
 #   - "vits-piper-en_US-libritts-high" (voice: libritts, quality: high, 256MB)
 model_id = "vits-piper-en_US-amy-low"
+
+# Cloud settings (used only when provider != "local"):
+#   model = "qwen3-tts-flash"
+#     dashscope:  qwen3-tts-flash (voices: `ttsandsttp voices`)
+#     groq:       canopylabs/orpheus-v1-english, canopylabs/orpheus-arabic-saudi
+#     openrouter: elevenlabs/eleven-v4-turbo, google/gemini-3.8-flash-tts,
+#                 deepgram/aura-2, minimax/speech-2.8-turbo, hexgrad/kokoro-82m,
+#                 ... full list: `ttsandsttp models --cap tts`
+#   voice = "Cherry"             # per-model voices: `ttsandsttp voices --provider <id> --model <model>`
+#   instructions = "warm, calm"  # style hint (supported models only)
+#   language_type = "English"    # DashScope only; derived from the language code if omitted
+#   stream = true                # DashScope SSE streaming PCM playback
+#   extra_params = { }           # extra request fields passed through verbatim
+#
+# Example (OpenRouter ElevenLabs):
+#   provider = "openrouter"
+#   model = "elevenlabs/eleven-v4-turbo"
+#   voice = "sarah"
 
 # Spanish (Spain) - Disabled by default
 # [tts.es]
@@ -110,22 +214,3 @@ model_id = "vits-piper-en_US-amy-low"
 #   - "vits-piper-pl_PL-justyna_wg_glos-medium" (voice: justyna, quality: medium, 60MB)
 #   - "vits-piper-pl_PL-mc_speech-medium" (voice: mc_speech, quality: medium, 60MB)
 # model_id = "vits-piper-pl_PL-zenski_wg_glos-medium"
-
-[stt]
-# Backend: "local" (offline Whisper) or "dashscope" (Qwen cloud ASR)
-provider = "local"
-
-# Cloud settings (used only when provider = "dashscope"):
-#   api_model = "qwen3-asr-flash"
-#   api_language = ""   # optional fixed language hint (e.g. "en", "zh")
-
-# Whisper model to use for Speech-to-Text (local provider)
-# Options: 
-#   - "sherpa-onnx-whisper-tiny" (recommended, multilingual, 75MB)
-#   - "sherpa-onnx-whisper-tiny.en" (English only, 75MB)
-#   - "sherpa-onnx-whisper-base" (multilingual, 150MB)
-#   - "sherpa-onnx-whisper-base.en" (English only, 150MB)
-#   - "sherpa-onnx-whisper-small" (multilingual, 500MB)
-#   - "sherpa-onnx-whisper-medium" (multilingual, 1.5GB)
-#   - "sherpa-onnx-whisper-large-v3" (multilingual, 3GB)
-model_id = "sherpa-onnx-whisper-tiny"

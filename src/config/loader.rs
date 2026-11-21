@@ -47,8 +47,24 @@ impl ConfigLoader {
         let content = fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
 
-        let config: AppConfig = toml::from_str(&content)
+        Self::parse_and_migrate(&content)
+    }
+
+    /// Parse TOML content and migrate legacy sections in memory.
+    pub fn parse_and_migrate(content: &str) -> Result<AppConfig> {
+        let mut config: AppConfig = toml::from_str(content)
             .context("Failed to parse config file")?;
+
+        if config.migrate_legacy() {
+            eprintln!(
+                "warning: the [api] section is deprecated and was migrated in memory to \
+                 [providers.dashscope]. Please rename it in {} \
+                 (support for [api] will be removed in a future release).",
+                Self::config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "config.toml".to_string())
+            );
+        }
 
         Ok(config)
     }

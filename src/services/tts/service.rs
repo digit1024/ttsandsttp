@@ -4,17 +4,24 @@
 //! Handles model management, audio generation, and playback.
 
 use anyhow::{Context, Result, bail};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use rayon::prelude::*;
-use tokio::sync::{mpsc, OnceCell};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{language_type_for_code, SharedConfig, TtsLanguageConfig};
-use crate::services::api::{DashScopeClient, DASHSCOPE_TTS_SAMPLE_RATE};
+use crate::config::{SharedConfig, TtsLanguageConfig};
+use crate::services::api::{
+    build_tts_backend, decode_speech_audio, AudioFormat, DashScopeClient, ResolvedTts, TtsBackend,
+    DASHSCOPE_TTS_SAMPLE_RATE,
+};
 use crate::services::ModelManager;
-use crate::utils::{DirectSampleSource, normalize_language_code, split_into_sentences};
+use crate::utils::{
+    chunk_text_for_tts, normalize_language_code, split_into_sentences, DirectSampleSource,
+    DEFAULT_TTS_FIRST_CHUNK_LENGTH,
+};
 
 /// Text-to-Speech Service
 ///
@@ -46,7 +53,13 @@ pub struct TtsService {
     shared_config: Arc<SharedConfig>, // Shared config and registry
     cancellation_token: Arc<Mutex<Option<CancellationToken>>>, // For immediate cancellation
     generation_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>, // Background generation task
-    api_client: Arc<OnceCell<Arc<DashScopeClient>>>, // Lazily resolved DashScope client
+    cloud_backends: Arc<Mutex<HashMap<String, Arc<CloudTts>>>>, // Cached per provider+language
+}
+
+/// Resolved cloud TTS context (backend + request parameters).
+struct CloudTts {
+    backend: Arc<TtsBackend>,
+    resolved: ResolvedTts,
 }
 
 #[derive(Clone, Debug)]
@@ -98,33 +111,47 @@ impl TtsService {
             shared_config: Arc::new(shared_config.clone()),
             cancellation_token: Arc::new(Mutex::new(None)),
             generation_task: Arc::new(Mutex::new(None)),
-            api_client: Arc::new(OnceCell::new()),
+            cloud_backends: Arc::new(Mutex::new(HashMap::new())),
         })
     }
     
-    /// Resolve (once) the DashScope client, failing loudly if no key is available.
-    async fn ensure_api_client(&self) -> Result<Arc<DashScopeClient>> {
-        let client = self
-            .api_client
-            .get_or_try_init(|| async {
-                DashScopeClient::new(&self.shared_config.config().api)
-                    .await
-                    .map(Arc::new)
-            })
-            .await?;
-        Ok(Arc::clone(client))
+    /// Resolve (and cache) the cloud TTS backend for a language's config,
+    /// failing loudly if no API key is available.
+    async fn ensure_cloud_tts(
+        &self,
+        lang_code: &str,
+        lang_cfg: &TtsLanguageConfig,
+    ) -> Result<Arc<CloudTts>> {
+        let cache_key = format!("{}|{}", lang_cfg.provider, lang_code);
+        if let Some(entry) = self.cloud_backends.lock().unwrap().get(&cache_key) {
+            return Ok(Arc::clone(entry));
+        }
+
+        let (backend, resolved) =
+            build_tts_backend(self.shared_config.config(), lang_code, lang_cfg)
+                .await?
+                .context("TTS cloud provider is not configured")?;
+        let entry = Arc::new(CloudTts {
+            backend: Arc::new(backend),
+            resolved,
+        });
+        self.cloud_backends
+            .lock()
+            .unwrap()
+            .insert(cache_key, Arc::clone(&entry));
+        Ok(entry)
     }
 
-    /// Return this language's config if it uses the DashScope provider.
-    fn cloud_language_config(&self) -> Option<TtsLanguageConfig> {
+    /// Return this language's effective config if it uses a cloud provider
+    /// (its own `[tts.<lang>]` section, or the global `[tts]` fallback).
+    fn cloud_language_config(&self) -> Option<(String, TtsLanguageConfig)> {
         let current = normalize_language_code(&self.current_language());
         self.shared_config
             .config()
             .tts
-            .languages
-            .get(&current)
-            .filter(|cfg| cfg.provider.is_dashscope())
-            .cloned()
+            .effective_language_config(&current)
+            .filter(|cfg| !cfg.is_local())
+            .map(|cfg| (current, cfg))
     }
     
     /// Get model files for a language code
@@ -133,10 +160,11 @@ impl TtsService {
         
         // Get model_id from config for this language
         let config = self.shared_config.config();
-        let model_id =             config.tts.languages
-                .get(lang_code)
-                .map(|lang_cfg| lang_cfg.model_id.clone())
-                .with_context(|| format!("Language '{}' not configured", lang_code))?;
+        let model_id = config
+            .tts
+            .effective_language_config(lang_code)
+            .map(|lang_cfg| lang_cfg.local_model())
+            .with_context(|| format!("Language '{}' not configured", lang_code))?;
         
         let model_info = registry.get_tts_model(lang_code, &model_id)
             .with_context(|| format!("No TTS model '{}' found for language: {}", model_id, lang_code))?;
@@ -166,12 +194,16 @@ impl TtsService {
         // Cloud provider: no local engine to load.
         {
             let config = self.shared_config.config();
-            if let Some(lang_cfg) = config.tts.languages.get(&normalized_lang) {
-                if lang_cfg.provider.is_dashscope() {
+            if let Some(lang_cfg) = config.tts.effective_language_config(&normalized_lang) {
+                if !lang_cfg.is_local() {
                     let mut state = self.write_state();
                     state.initialized = true;
                     state.current_language = normalized_lang;
-                    tracing::info!("DashScope TTS provider selected for '{}'", lang_code);
+                    tracing::info!(
+                        "Cloud TTS provider '{}' selected for '{}'",
+                        lang_cfg.provider,
+                        lang_code
+                    );
                     return Ok(());
                 }
             }
@@ -283,9 +315,9 @@ impl TtsService {
             self.init_with_language(&current_lang).await?;
         }
 
-        // Cloud provider path (Qwen TTS)
-        if let Some(lang_cfg) = self.cloud_language_config() {
-            return self.speak_cloud(text, &lang_cfg).await;
+        // Cloud provider path (any non-local TTS provider)
+        if let Some((lang, lang_cfg)) = self.cloud_language_config() {
+            return self.speak_cloud(text, &lang, &lang_cfg).await;
         }
 
         // Pre-create audio stream before generation (optimization #2)
@@ -328,9 +360,9 @@ impl TtsService {
         result
     }
 
-    /// Cloud TTS path: stream PCM per sentence and play it.
-    async fn speak_cloud(&self, text: &str, lang_config: &TtsLanguageConfig) -> Result<()> {
-        let client = self.ensure_api_client().await?;
+    /// Cloud TTS path: synthesize per chunk and play it.
+    async fn speak_cloud(&self, text: &str, lang: &str, lang_config: &TtsLanguageConfig) -> Result<()> {
+        let cloud = self.ensure_cloud_tts(lang, lang_config).await?;
         self.ensure_audio_stream()?;
 
         {
@@ -338,7 +370,7 @@ impl TtsService {
             state.playing = true;
         }
 
-        let result = self.speak_cloud_inner(&client, text, lang_config).await;
+        let result = self.speak_cloud_inner(&cloud, text).await;
 
         {
             let mut state = self.write_state();
@@ -351,12 +383,7 @@ impl TtsService {
         result
     }
 
-    async fn speak_cloud_inner(
-        &self,
-        client: &DashScopeClient,
-        text: &str,
-        lang_config: &TtsLanguageConfig,
-    ) -> Result<()> {
+    async fn speak_cloud_inner(&self, cloud: &Arc<CloudTts>, text: &str) -> Result<()> {
         let cancellation_token = CancellationToken::new();
         {
             let mut token_guard = self.cancellation_token.lock().unwrap();
@@ -368,17 +395,44 @@ impl TtsService {
             sink_guard.clone().ok_or_else(|| anyhow::anyhow!("Audio sink not available"))?
         };
 
-        let voice = if lang_config.voice.trim().is_empty() {
-            "Cherry".to_string()
-        } else {
-            lang_config.voice.clone()
-        };
-        let language_type = if lang_config.language_type.trim().is_empty() {
-            language_type_for_code(&normalize_language_code(&self.current_language())).to_string()
-        } else {
-            lang_config.language_type.clone()
+        let resolved = &cloud.resolved;
+        if resolved.model.trim().is_empty() {
+            bail!(
+                "TTS provider '{}' has no model configured",
+                resolved.provider_id
+            );
+        }
+
+        let result = match &*cloud.backend {
+            TtsBackend::DashScope(client) if resolved.stream => {
+                self.speak_dashscope_streaming(client, text, resolved, &sink, &cancellation_token)
+                    .await
+            }
+            TtsBackend::DashScope(client) => {
+                self.speak_dashscope_batch(client, text, resolved, &sink, &cancellation_token)
+                    .await
+            }
+            TtsBackend::OpenAi(_) => {
+                self.speak_openai_chunked(cloud, text, &sink, &cancellation_token)
+                    .await
+            }
         };
 
+        if result.is_ok() {
+            self.wait_for_sink_drain(&sink, &cancellation_token).await;
+        }
+        result
+    }
+
+    /// DashScope SSE streaming: PCM chunks are appended as they arrive.
+    async fn speak_dashscope_streaming(
+        &self,
+        client: &DashScopeClient,
+        text: &str,
+        resolved: &ResolvedTts,
+        sink: &Arc<rodio::Sink>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<()> {
         let sentences = split_into_sentences(text);
         if sentences.is_empty() {
             return Ok(());
@@ -400,17 +454,139 @@ impl TtsService {
 
             client
                 .synthesize_pcm_stream(
-                    &lang_config.api_model,
+                    &resolved.model,
                     &sentence,
-                    &voice,
-                    &language_type,
-                    &cancellation_token,
+                    &resolved.voice,
+                    &resolved.language_type,
+                    cancellation_token,
                     on_chunk,
                 )
                 .await?;
         }
+        Ok(())
+    }
 
-        self.wait_for_sink_drain(&sink, &cancellation_token).await;
+    /// DashScope non-streaming: synthesize each sentence, decode and queue.
+    async fn speak_dashscope_batch(
+        &self,
+        client: &DashScopeClient,
+        text: &str,
+        resolved: &ResolvedTts,
+        sink: &Arc<rodio::Sink>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<()> {
+        let sentences = split_into_sentences(text);
+        for sentence in sentences {
+            if cancellation_token.is_cancelled() {
+                break;
+            }
+            let bytes = client
+                .synthesize_bytes(
+                    &resolved.model,
+                    &sentence,
+                    &resolved.voice,
+                    &resolved.language_type,
+                )
+                .await?;
+            let audio = decode_speech_audio(bytes, AudioFormat::Wav)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            if cancellation_token.is_cancelled() {
+                break;
+            }
+            sink.append(DirectSampleSource::new(audio.samples, audio.sample_rate));
+        }
+        Ok(())
+    }
+
+    /// OpenAI-compatible `/audio/speech`: chunk the text to the model's
+    /// request budget, synthesize with prefetch so playback never waits on
+    /// the network, and queue chunks gaplessly (port of LunaAI's
+    /// TtsPlaybackPipeline).
+    async fn speak_openai_chunked(
+        &self,
+        cloud: &Arc<CloudTts>,
+        text: &str,
+        sink: &Arc<rodio::Sink>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<()> {
+        const PREFETCH_DEPTH: usize = 2;
+        const MAX_ATTEMPTS: usize = 2;
+        const RETRY_DELAY: Duration = Duration::from_millis(300);
+
+        let chunks = chunk_text_for_tts(
+            text,
+            cloud.resolved.max_chars,
+            Some(DEFAULT_TTS_FIRST_CHUNK_LENGTH),
+        );
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        let total_chunks = chunks.len();
+
+        let mut inflight: HashMap<usize, tokio::task::JoinHandle<Option<crate::services::api::SpeechAudio>>> =
+            HashMap::new();
+
+        for index in 0..total_chunks {
+            if cancellation_token.is_cancelled() {
+                break;
+            }
+
+            // Keep the next chunks in flight while the current one plays.
+            let last = (index + PREFETCH_DEPTH).min(total_chunks - 1);
+            for (ahead, chunk_text) in chunks.iter().enumerate().take(last + 1).skip(index) {
+                if let std::collections::hash_map::Entry::Vacant(slot) = inflight.entry(ahead) {
+                    let cloud = Arc::clone(cloud);
+                    let chunk = chunk_text.clone();
+                    let token = cancellation_token.clone();
+                    slot.insert(
+                        tokio::spawn(async move {
+                            for attempt in 1..=MAX_ATTEMPTS {
+                                if token.is_cancelled() {
+                                    return None;
+                                }
+                                match cloud.backend.synthesize_chunk(&chunk, &cloud.resolved).await {
+                                    Ok(audio) => return Some(audio),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "TTS chunk {}/{} attempt {} failed: {}",
+                                            ahead + 1,
+                                            total_chunks,
+                                            attempt,
+                                            e
+                                        );
+                                        if !e.retryable || attempt == MAX_ATTEMPTS {
+                                            return None;
+                                        }
+                                        tokio::time::sleep(RETRY_DELAY).await;
+                                    }
+                                }
+                            }
+                            None
+                        }),
+                    );
+                }
+            }
+
+            let handle = inflight.remove(&index).expect("chunk task was spawned");
+            let audio = handle.await.context("TTS synthesis task failed")?;
+            let Some(audio) = audio else {
+                tracing::warn!(
+                    "TTS: no audio for chunk {}/{}, skipping",
+                    index + 1,
+                    chunks.len()
+                );
+                continue;
+            };
+            if cancellation_token.is_cancelled() {
+                break;
+            }
+            sink.append(DirectSampleSource::new(audio.samples, audio.sample_rate));
+        }
+
+        // Abort anything still in flight (cancellation or early exit).
+        for (_, handle) in inflight.drain() {
+            handle.abort();
+        }
         Ok(())
     }
 
@@ -921,15 +1097,25 @@ impl TtsService {
     /// Set the language (e.g., "pl", "en", "pl-PL")
     /// 
     /// This will reload the TTS engine with the appropriate model for the language.
-    /// The language code is normalized (e.g., "pl-PL" -> "pl").
+    /// The language code is normalized (e.g., "pl-PL" -> "pl"). An empty
+    /// language means "unspecified" and falls back to the configured
+    /// `[tts] default` language.
     pub async fn set_language(&self, lang: &str) -> Result<()> {
-        let normalized_lang = normalize_language_code(lang);
-        
-        // Check if language is enabled in config
         let config = self.shared_config.config();
-        let lang_config = config.tts.languages.get(&normalized_lang)
+        let normalized_lang = {
+            let normalized = normalize_language_code(lang);
+            if normalized.is_empty() {
+                config.tts.default.clone()
+            } else {
+                normalized
+            }
+        };
+
+        // Check if language is enabled in config (own section or global
+        // cloud fallback)
+        let lang_config = config.tts.effective_language_config(&normalized_lang)
             .ok_or_else(|| anyhow::anyhow!("Language '{}' not configured", normalized_lang))?;
-        
+
         if !lang_config.enabled {
             anyhow::bail!("Language '{}' is not enabled in config", normalized_lang);
         }

@@ -4,10 +4,10 @@
 //! Handles audio capture, pause detection, and transcription.
 
 use anyhow::{Context, Result, bail};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
 use super::audio_processor::AudioProcessor;
@@ -16,7 +16,7 @@ use super::audio_utils::{
 };
 use super::pause_detector::PauseDetector;
 use crate::config::SharedConfig;
-use crate::services::api::DashScopeClient;
+use crate::services::api::{build_stt_backend, ResolvedStt, SttBackend};
 use crate::services::ModelManager;
 use crate::utils::{create_wav_buffer, normalize_language_code, play_beep, play_beep_blocking, BEEP_HIGH_WAV, BEEP_LOW_WAV};
 use tracing;
@@ -71,14 +71,13 @@ pub struct SttService {
     decode_complete_rx: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<Result<String, String>>>>>,
     shared_config: Arc<SharedConfig>, // Shared config and registry
     cancellation_token: Arc<Mutex<Option<CancellationToken>>>, // For immediate cancellation
-    api_client: Arc<OnceCell<Arc<DashScopeClient>>>, // Lazily resolved DashScope client
+    cloud_backends: Arc<Mutex<HashMap<String, Arc<CloudStt>>>>, // Cached per provider+language
 }
 
 /// Cloud ASR context passed into the audio capture task
-struct CloudAsr {
-    client: Arc<DashScopeClient>,
-    model: String,
-    language: String,
+struct CloudStt {
+    backend: Arc<SttBackend>,
+    resolved: ResolvedStt,
 }
 
 /// Internal state of the STT service
@@ -168,28 +167,47 @@ impl SttService {
             decode_complete_rx: Arc::new(Mutex::new(None)),
             shared_config: Arc::new(shared_config.clone()),
             cancellation_token: Arc::new(Mutex::new(None)),
-            api_client: Arc::new(OnceCell::new()),
+            cloud_backends: Arc::new(Mutex::new(HashMap::new())),
         })
     }
     
-    /// Resolve (once) the DashScope client, failing loudly if no key is available.
-    async fn ensure_api_client(&self) -> Result<Arc<DashScopeClient>> {
-        let client = self
-            .api_client
-            .get_or_try_init(|| async {
-                DashScopeClient::new(&self.shared_config.config().api)
-                    .await
-                    .map(Arc::new)
-            })
-            .await?;
-        Ok(Arc::clone(client))
+    /// Resolve (and cache) the cloud STT backend for the configured provider.
+    /// Returns `None` for the local provider. The API key is resolved lazily
+    /// on first use so a locked keyring cannot block daemon startup.
+    async fn ensure_cloud_stt(&self, request_lang: &str) -> Result<Option<Arc<CloudStt>>> {
+        let config = self.shared_config.config();
+        let effective = config.stt.for_language(request_lang);
+        if effective.is_local() {
+            return Ok(None);
+        }
+        let cache_key = format!(
+            "{}|{}",
+            effective.provider,
+            normalize_language_code(request_lang)
+        );
+        if let Some(entry) = self.cloud_backends.lock().unwrap().get(&cache_key) {
+            return Ok(Some(Arc::clone(entry)));
+        }
+
+        let (backend, resolved) = build_stt_backend(config, request_lang)
+            .await?
+            .context("STT cloud provider is not configured")?;
+        let entry = Arc::new(CloudStt {
+            backend: Arc::new(backend),
+            resolved,
+        });
+        self.cloud_backends
+            .lock()
+            .unwrap()
+            .insert(cache_key, Arc::clone(&entry));
+        Ok(Some(entry))
     }
     
     
-    /// Get Whisper model files based on config
-    fn get_whisper_model_files(&self) -> Result<(PathBuf, PathBuf, PathBuf, String)> {
+    /// Get Whisper model files for a language's effective config
+    fn get_whisper_model_files(&self, lang: &str) -> Result<(PathBuf, PathBuf, PathBuf, String)> {
         let config = self.shared_config.config();
-        let model_id = config.stt.model_id.clone();
+        let model_id = config.stt.for_language(lang).local_model();
         
         let registry = self.shared_config.registry();
         let model_info = registry.get_stt_model(&model_id)
@@ -230,10 +248,15 @@ impl SttService {
 
         // Cloud provider: no local model to load. The API key is resolved lazily
         // on first use so a locked keyring cannot block daemon startup.
-        if self.shared_config.config().stt.provider.is_dashscope() {
+        let init_lang = self.read_state().current_language.clone();
+        let effective = self.shared_config.config().stt.for_language(&init_lang);
+        if !effective.is_local() {
             let mut state = self.write_state();
             state.initialized = true;
-            tracing::info!("DashScope STT provider selected (key resolved on first use)");
+            tracing::info!(
+                "Cloud STT provider '{}' selected (key resolved on first use)",
+                effective.provider
+            );
             return Ok(());
         }
 
@@ -243,7 +266,8 @@ impl SttService {
         }
 
         // Get Whisper model files from config
-        let (encoder_file, decoder_file, tokens_file, default_language) = self.get_whisper_model_files()?;
+        let (encoder_file, decoder_file, tokens_file, default_language) =
+            self.get_whisper_model_files(&init_lang)?;
 
         // Validate model files exist
         Self::validate_model_files(&encoder_file, &decoder_file, &tokens_file)?;
@@ -310,7 +334,7 @@ impl SttService {
     pub async fn init_with_language(&self, lang_code: &str) -> Result<()> {
         let normalized_lang = normalize_language_code(lang_code);
         
-        if self.shared_config.config().stt.provider.is_dashscope() {
+        if !self.shared_config.config().stt.for_language(&normalized_lang).is_local() {
             let mut state = self.write_state();
             state.initialized = true;
             state.current_language = normalized_lang;
@@ -318,16 +342,22 @@ impl SttService {
         }
 
         // Get Whisper model files from config
-        let (encoder_file, decoder_file, tokens_file, model_language) = self.get_whisper_model_files()?;
+        let (encoder_file, decoder_file, tokens_file, model_language) =
+            self.get_whisper_model_files(&normalized_lang)?;
 
         // Validate model files exist
         Self::validate_model_files(&encoder_file, &decoder_file, &tokens_file)?;
 
         // Determine language to use
-        // If model is multilingual, use the requested language
-        // If model is language-specific, use the model's language
+        // If model is multilingual, use the requested language; an empty
+        // (unspecified) language falls back to English, matching init().
+        // If model is language-specific, use the model's language.
         let language = if model_language == "multilingual" {
-            normalized_lang.clone()
+            if normalized_lang.is_empty() {
+                "en".to_string()
+            } else {
+                normalized_lang.clone()
+            }
         } else {
             // Model is language-specific, use its language
             model_language.clone()
@@ -388,22 +418,12 @@ impl SttService {
     /// Start listening for speech (async)
     pub async fn start_listening(&self, lang: &str, pause_duration: Duration) -> Result<()> {
         let normalized_lang = normalize_language_code(lang);
-        let stt_config = self.shared_config.config().stt.clone();
+        let stt_config = self.shared_config.config().stt.for_language(&normalized_lang);
 
-        // For the cloud provider, resolve the API client up front so we fail
+        // For a cloud provider, resolve the API client up front so we fail
         // loudly (before recording) if no key is available.
-        let cloud_asr = if stt_config.provider.is_dashscope() {
-            let client = self.ensure_api_client().await?;
-            let language = if stt_config.api_language.trim().is_empty() {
-                normalized_lang.clone()
-            } else {
-                stt_config.api_language.clone()
-            };
-            Some(Arc::new(CloudAsr {
-                client,
-                model: stt_config.api_model.clone(),
-                language,
-            }))
+        let cloud_asr = if !stt_config.is_local() {
+            self.ensure_cloud_stt(&normalized_lang).await?
         } else {
             // Local provider: ensure the Whisper recognizer matches the language.
             let recognizer_exists = {
@@ -527,7 +547,7 @@ impl SttService {
     /// Audio capture loop - handles audio input and recognition with cancellation support
     async fn audio_capture_loop(
         recognizer: Arc<Mutex<Option<sherpa_rs::whisper::WhisperRecognizer>>>,
-        cloud_asr: Option<Arc<CloudAsr>>,
+        cloud_asr: Option<Arc<CloudStt>>,
         result_callback: Arc<Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>>>,
         pause_callback: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>,
         error_callback: Arc<Mutex<Option<Box<dyn Fn(String) + Send + Sync>>>>,
@@ -832,7 +852,7 @@ impl SttService {
     /// Decode accumulated audio using the configured backend
     async fn decode_accumulated_audio(
         recognizer: &Arc<Mutex<Option<sherpa_rs::whisper::WhisperRecognizer>>>,
-        cloud_asr: &Option<Arc<CloudAsr>>,
+        cloud_asr: &Option<Arc<CloudStt>>,
         result_callback: &Arc<Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>>>,
         state: &Arc<RwLock<SttState>>,
         accumulated_audio: &mut Vec<f32>,
@@ -888,7 +908,7 @@ impl SttService {
             match Self::transcribe_cloud(cloud, &audio_to_decode).await {
                 Ok(text) => text,
                 Err(e) => {
-                    tracing::error!("DashScope ASR failed: {:#}", e);
+                    tracing::error!("Cloud ASR failed: {:#}", e);
                     {
                         let mut state_guard = state.write().unwrap();
                         state_guard.current_text = String::new();
@@ -942,19 +962,15 @@ impl SttService {
         }
     }
 
-    /// Transcribe audio using DashScope (f32 PCM -> 16-bit WAV -> base64).
-    async fn transcribe_cloud(cloud: &CloudAsr, samples: &[f32]) -> Result<String> {
+    /// Transcribe audio via the configured cloud backend
+    /// (f32 PCM -> 16-bit WAV -> provider request).
+    async fn transcribe_cloud(cloud: &CloudStt, samples: &[f32]) -> Result<String> {
         let pcm_i16: Vec<i16> = samples
             .iter()
             .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
             .collect();
         let wav = create_wav_buffer(&pcm_i16, TARGET_SAMPLE_RATE)?;
-        let language = if cloud.language.trim().is_empty() {
-            None
-        } else {
-            Some(cloud.language.as_str())
-        };
-        cloud.client.transcribe(&cloud.model, &wav, language).await
+        cloud.backend.transcribe(&wav, &cloud.resolved).await
     }
 
     /// Stop listening and return the recognized text with immediate cancellation

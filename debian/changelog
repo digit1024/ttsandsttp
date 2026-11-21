@@ -1,3 +1,29 @@
+ttsandsttp (1.4-1) unstable; urgency=medium
+
+  * Multi-provider STT and TTS catalog (bundled providers.json)
+    - Groq, OpenRouter, Qwen/DashScope and any OpenAI-compatible endpoint
+      for both directions, plus custom OpenAI/DashScope providers
+    - 9 STT models and 20 TTS models with per-model request limits,
+      voice lists, response formats and instruction support
+    - OpenAI-compatible STT (multipart) and TTS (/audio/speech) clients
+      with response-format negotiation, PCM/WAV/MP3 decoding and chunking
+  * Larger TOML configuration
+    - [providers.<id>] sections with endpoint, key and timeout overrides
+    - [api] is deprecated and migrated in memory to [providers.dashscope]
+    - API keys are scoped per provider: systemd credentials, keyring,
+      0600 file or environment variable
+    - `set-key`/`del-key` accept an optional provider argument
+  * Language is optional
+    - Cloud STT auto-detects the language; the DBus language may be empty
+    - Global [tts] fallback speaks any language; per-language [tts.<lang>]
+      sections and [stt.<lang>] overrides remain available
+  * TTS playback pipeline: text chunking, prefetching, retries, gapless
+  * New CLI: `providers`, `models`, `bench-tts`; `bench-stt` gains
+    --provider/--model
+  * Local (sherpa) remains the default and works fully offline
+
+ -- digit1024 <digit1024@example.com>  Sat, 21 Nov 2026 07:46:03 +0100
+
 ttsandsttp (1.3-1) unstable; urgency=medium
 
   * Cloud providers (Alibaba Cloud Model Studio / DashScope "Qwen")

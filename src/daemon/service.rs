@@ -32,6 +32,10 @@ const MAX_STT_TIMEOUT_CHECKS: u64 = STT_TIMEOUT_MS / STT_CHECK_INTERVAL_MS; // 6
 /// - `stt(language: String, pause_duration: f64)` - Convert speech to text
 /// - `stt_type(language: String, pause_duration: f64)` - Convert speech to text and type it
 /// - `stop()` - Stop current playback
+///
+/// The `language` argument is optional in meaning: pass `""` to let cloud
+/// models auto-detect the language (STT) or to use the configured `[tts]
+/// default` language (TTS). Local Whisper falls back to English when unset.
 /// 
 /// # DBus Signals
 /// - `StatusChanged(status: String)` - Emitted when status changes (idle/speaking/listening/processing)
@@ -462,6 +466,10 @@ impl TtsSttService {
 
     /// Text-to-Speech: Convert text to speech
     ///
+    /// `language` may be empty: the configured `[tts] default` language is
+    /// used, resolved through its `[tts.<lang>]` section or the global
+    /// `[tts]` cloud fallback.
+    ///
     /// Cancels any ongoing STT operation and stops any previous TTS operation
     /// before starting the new TTS request.
     ///
@@ -488,6 +496,10 @@ impl TtsSttService {
     }
 
     /// Speech-to-Text: Convert speech to text
+    ///
+    /// `language` may be empty: cloud providers auto-detect the spoken
+    /// language per request (unless `[stt] language` pins one); local Whisper
+    /// defaults to English for multilingual models.
     ///
     /// Stops any ongoing TTS operation and cancels any previous STT operation
     /// before starting the new STT request.
@@ -576,6 +588,9 @@ impl TtsSttService {
 
 
     /// Speech-to-Text Type: Convert speech to text and type it character-by-character using wrtype
+    ///
+    /// `language` may be empty (same semantics as `stt()`: cloud auto-detect,
+    /// local Whisper defaults to English).
     ///
     /// Starts STT and waits for it to complete, then types the recognized text.
     /// Note: This method waits for STT completion internally (unlike stt() which returns immediately).

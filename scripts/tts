@@ -1,7 +1,11 @@
 #!/bin/bash
+# Read the clipboard aloud. Language is optional: "" uses the configured
+# [tts] default (and the global cloud fallback speaks any language).
+# Pass a language to override, e.g.: tts pl-PL
+LANG_CODE="${1:-}"
 dbus-send --session \
   --dest=com.github.digit1024.ttsstt \
   --type=method_call \
   /com/github/digit1024/ttsstt \
   com.github.digit1024.ttsstt.Service.Tts \
-  string:"$(wl-paste --no-newline)" string:"en-US"
+  string:"$(wl-paste --no-newline)" string:"$LANG_CODE"

@@ -22,8 +22,8 @@ impl ConfigModelDownloader {
 
         // Download enabled TTS models
         for (lang_code, lang_config) in &config.tts.languages {
-            if lang_config.enabled && !lang_config.provider.is_dashscope() {
-                if let Some(model_info) = registry.get_tts_model(lang_code, &lang_config.model_id) {
+            if lang_config.enabled && lang_config.is_local() {
+                if let Some(model_info) = registry.get_tts_model(lang_code, &lang_config.local_model()) {
                     tracing::info!("Downloading TTS model for {}: {}", lang_code, model_info.id);
                     
                     let models_dir = model_manager.models_dir();
@@ -60,15 +60,36 @@ impl ConfigModelDownloader {
             }
         }
 
-        // Download STT model
-        if config.stt.provider.is_dashscope() {
-            tracing::info!("STT provider is dashscope; skipping local Whisper model download");
-        } else if let Some(model_info) = registry.get_stt_model(&config.stt.model_id) {
+        // Download STT model(s): the global one plus any local models
+        // referenced by per-language [stt.<lang>] overrides.
+        let mut stt_model_ids: Vec<String> = Vec::new();
+        if config.stt.is_local() {
+            stt_model_ids.push(config.stt.local_model());
+        } else {
+            tracing::info!(
+                "STT provider is '{}'; skipping local Whisper model download",
+                config.stt.provider
+            );
+        }
+        for lang in config.stt.languages.keys() {
+            let effective = config.stt.for_language(lang);
+            if effective.is_local() {
+                let model_id = effective.local_model();
+                if !model_id.is_empty() && !stt_model_ids.contains(&model_id) {
+                    stt_model_ids.push(model_id);
+                }
+            }
+        }
+
+        for model_id in stt_model_ids {
+            let Some(model_info) = registry.get_stt_model(&model_id) else {
+                continue;
+            };
             tracing::info!("Downloading STT model: {}", model_info.id);
-            
+
             let models_dir = model_manager.models_dir();
             let model_path = models_dir.join("whisper").join(&model_info.id);
-            
+
             model_manager
                 .download_model_by_url(
                     &model_info.download_url,
@@ -78,7 +99,7 @@ impl ConfigModelDownloader {
                 )
                 .await
                 .with_context(|| format!("Failed to download STT model: {}", model_info.id))?;
-            
+
             tracing::info!("STT model {} ready", model_info.id);
         }
 

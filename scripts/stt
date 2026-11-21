@@ -1,7 +1,11 @@
 #!/bin/bash
+# One-click dictation. Language is optional: "" lets cloud providers
+# auto-detect the spoken language (local Whisper defaults to English).
+# Pass a language to force it, e.g.: stt pl-PL
+LANG_CODE="${1:-}"
 dbus-send --session \
   --dest=com.github.digit1024.ttsstt \
   --type=method_call \
   /com/github/digit1024/ttsstt \
   com.github.digit1024.ttsstt.Service.SttType \
-  string:"en-US" double:2.0
+  string:"$LANG_CODE" double:2.0

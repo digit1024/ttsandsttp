@@ -27,6 +27,8 @@ pub struct DashScopeClient {
     http: Client,
     base_url: String,
     api_key: SecretString,
+    stt_endpoint_override: Option<String>,
+    tts_endpoint_override: Option<String>,
 }
 
 impl std::fmt::Debug for DashScopeClient {
@@ -41,24 +43,51 @@ impl std::fmt::Debug for DashScopeClient {
 impl DashScopeClient {
     /// Build a client, resolving the API key via [`Secrets`].
     pub async fn new(api: &ApiConfig) -> Result<Self> {
+        Self::new_with_endpoints(api, None, None).await
+    }
+
+    /// Build a client with optional full endpoint overrides (used by custom
+    /// DashScope-compatible providers configured via `[providers.<id>]`).
+    pub async fn new_with_endpoints(
+        api: &ApiConfig,
+        stt_endpoint: Option<String>,
+        tts_endpoint: Option<String>,
+    ) -> Result<Self> {
         let api_key = Secrets::resolve(api).await?;
         let http = Client::builder()
             .timeout(Duration::from_secs(api.timeout_secs.max(5)))
             .build()
             .context("Failed to build HTTP client")?;
         let base_url = api.effective_base_url().trim_end_matches('/').to_string();
-        if base_url.is_empty() {
-            bail!("DashScope base_url is empty (set [api] base_url or choose a region)");
+        if base_url.is_empty() && stt_endpoint.is_none() && tts_endpoint.is_none() {
+            bail!(
+                "DashScope base_url is empty (set [providers.dashscope] base_url \
+                 or choose a region)"
+            );
         }
         Ok(Self {
             http,
             base_url,
             api_key,
+            stt_endpoint_override: stt_endpoint.filter(|s| !s.trim().is_empty()),
+            tts_endpoint_override: tts_endpoint.filter(|s| !s.trim().is_empty()),
         })
     }
 
     fn generation_url(&self) -> String {
         format!("{}/services/aigc/multimodal-generation/generation", self.base_url)
+    }
+
+    fn stt_url(&self) -> String {
+        self.stt_endpoint_override
+            .clone()
+            .unwrap_or_else(|| self.generation_url())
+    }
+
+    fn tts_url(&self) -> String {
+        self.tts_endpoint_override
+            .clone()
+            .unwrap_or_else(|| self.generation_url())
     }
 
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -67,28 +96,47 @@ impl DashScopeClient {
 
     /// Transcribe a WAV buffer with `qwen3-asr-flash`.
     ///
-    /// `language` is an optional DashScope language hint (e.g. `"en"`, `"zh"`).
-    pub async fn transcribe(&self, model: &str, wav: &[u8], language: Option<&str>) -> Result<String> {
+    /// `language` is an optional DashScope language hint (e.g. `"en"`, `"zh"`);
+    /// when absent, per-request language identification is enabled.
+    /// `hints` are passed as a system message (vocabulary biasing).
+    pub async fn transcribe(
+        &self,
+        model: &str,
+        wav: &[u8],
+        language: Option<&str>,
+        hints: &[String],
+    ) -> Result<String> {
         let data_url = format!("data:audio/wav;base64,{}", BASE64.encode(wav));
 
         let mut parameters = serde_json::Map::new();
-        if let Some(lang) = language.filter(|l| !l.is_empty()) {
-            parameters.insert("asr_options".to_string(), json!({ "language": lang }));
+        let asr_options = match language.filter(|l| !l.trim().is_empty()) {
+            Some(lang) => json!({ "language": lang }),
+            None => json!({ "enable_lid": true }),
+        };
+        parameters.insert("asr_options".to_string(), asr_options);
+
+        let mut messages: Vec<Value> = Vec::new();
+        if !hints.is_empty() {
+            messages.push(json!({
+                "role": "system",
+                "content": [{ "text": format!("Expected vocabulary: {}", hints.join(", ")) }],
+            }));
         }
+        messages.push(json!({
+            "role": "user",
+            "content": [{ "audio": data_url }],
+        }));
 
         let body = json!({
             "model": model,
             "input": {
-                "messages": [{
-                    "role": "user",
-                    "content": [{ "audio": data_url }]
-                }]
+                "messages": messages
             },
             "parameters": Value::Object(parameters),
         });
 
         let response = self
-            .auth(self.http.post(self.generation_url()))
+            .auth(self.http.post(self.stt_url()))
             .json(&body)
             .send()
             .await
@@ -133,7 +181,7 @@ impl DashScopeClient {
         });
 
         let request = self
-            .auth(self.http.post(self.generation_url()))
+            .auth(self.http.post(self.tts_url()))
             .header("X-DashScope-SSE", "enable")
             .json(&body)
             .send();
@@ -188,7 +236,8 @@ impl DashScopeClient {
         Ok(())
     }
 
-    /// Non-streaming synthesis: returns raw audio bytes from the returned URL.
+    /// Non-streaming synthesis: returns raw WAV bytes, either from the
+    /// base64 `output.audio.data` field or by downloading `output.audio.url`.
     pub async fn synthesize_bytes(
         &self,
         model: &str,
@@ -202,11 +251,13 @@ impl DashScopeClient {
                 "text": text,
                 "voice": voice,
                 "language_type": language_type,
+                "format": "wav",
+                "sample_rate": DASHSCOPE_TTS_SAMPLE_RATE,
             }
         });
 
         let response = self
-            .auth(self.http.post(self.generation_url()))
+            .auth(self.http.post(self.tts_url()))
             .json(&body)
             .send()
             .await
@@ -222,10 +273,21 @@ impl DashScopeClient {
             .json()
             .await
             .context("Failed to parse DashScope TTS response")?;
+
+        if let Some(data) = value
+            .pointer("/output/audio/data")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return BASE64
+                .decode(data)
+                .context("Failed to decode DashScope TTS audio data");
+        }
+
         let url = value
             .pointer("/output/audio/url")
             .and_then(|v| v.as_str())
-            .context("DashScope TTS response did not include an audio URL")?;
+            .context("DashScope TTS response did not include audio data or URL")?;
 
         let audio = self
             .http
